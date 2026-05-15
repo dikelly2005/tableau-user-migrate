@@ -1,0 +1,337 @@
+# =============================================================================
+# TABLEAU USER MIGRATE TOOL — ENDPOINT REGISTRY
+# =============================================================================
+# Cloned from: REFERENCE/tableau_metadata_extractor/config/endpoints.yaml
+# Trimmed to endpoints relevant to user migration operations.
+#
+# Source: https://help.tableau.com/current/api/rest_api/en-us/REST/rest_api_ref.htm
+# API Version: 3.21+
+#
+# Schema:
+#   path:            URL pattern ({site_id}, {workbook_id}, etc. replaced at runtime)
+#   response_key:    wrapper.item path in XML response body
+#   parent:          endpoint name that provides IDs for child lookups
+#   format:          json for newer api/-/ endpoints (default: xml)
+#   params:          default query parameters
+#   cache:           true to pre-fetch into dimension cache at startup
+#   permissions_endpoint: path template for permission cloning (if applicable)
+#   ownership_transferable: true if ownership can be changed via PUT
+#   primary_key:     ID field name if not "id" (e.g., "luid", "clientId")
+#   single_object:   true if endpoint returns one object (not paginated)
+#
+# Consumers:
+#   src/utils/cache.py          — warmup fetches entries where cache: true
+#   src/services/permissions.py — iterates entries with permissions_endpoint
+#   src/services/ownership.py   — iterates entries with ownership_transferable: true
+#   src/services/*.py           — child lookups resolved via cache parent_id/owner_id
+# =============================================================================
+
+endpoints:
+
+  # ===========================================================================
+  # USERS AND GROUPS (dimensions — cached first, used by every workflow)
+  # ===========================================================================
+
+  users:
+    path: "sites/{site_id}/users"
+    response_key: users.user
+    cache: true
+
+  groups:
+    path: "sites/{site_id}/groups"
+    response_key: groups.group
+    cache: true
+
+  group_users:
+    path: "sites/{site_id}/groups/{group_id}/users"
+    response_key: users.user
+    parent: groups
+
+  # ===========================================================================
+  # PROJECTS
+  # ===========================================================================
+
+  projects:
+    path: "sites/{site_id}/projects"
+    response_key: projects.project
+    cache: true
+    permissions_endpoint: "sites/{site_id}/projects/{id}/permissions"
+    ownership_transferable: true
+
+  # ===========================================================================
+  # WORKBOOKS AND VIEWS
+  # ===========================================================================
+
+  workbooks:
+    path: "sites/{site_id}/workbooks"
+    response_key: workbooks.workbook
+    cache: true
+    permissions_endpoint: "sites/{site_id}/workbooks/{id}/permissions"
+    ownership_transferable: true
+
+  views:
+    path: "sites/{site_id}/views"
+    response_key: views.view
+    cache: true
+    permissions_endpoint: "sites/{site_id}/views/{id}/permissions"
+
+  custom_views:
+    path: "sites/{site_id}/customviews"
+    response_key: customViews.customView
+    cache: true
+
+  custom_view_default_users:
+    path: "sites/{site_id}/customviews/{custom_view_luid}/default/users"
+    response_key: users.user
+    parent: custom_views
+
+  # ===========================================================================
+  # DATA SOURCES
+  # ===========================================================================
+
+  datasources:
+    path: "sites/{site_id}/datasources"
+    response_key: datasources.datasource
+    cache: true
+    permissions_endpoint: "sites/{site_id}/datasources/{id}/permissions"
+    ownership_transferable: true
+
+  # ===========================================================================
+  # FLOWS
+  # ===========================================================================
+
+  flows:
+    path: "sites/{site_id}/flows"
+    response_key: flows.flow
+    cache: true
+    permissions_endpoint: "sites/{site_id}/flows/{id}/permissions"
+    ownership_transferable: true
+
+  # ===========================================================================
+  # VIRTUAL CONNECTIONS
+  # ===========================================================================
+
+  virtual_connections:
+    path: "sites/{site_id}/virtualconnections"
+    response_key: virtualConnections.virtualConnection
+    cache: true
+    permissions_endpoint: "sites/{site_id}/virtualconnections/{id}/permissions"
+    ownership_transferable: true
+    params:
+      fields: _all_
+
+  # ===========================================================================
+  # METADATA (external assets with permissions)
+  # ===========================================================================
+
+  # databases:
+  #   path: "sites/{site_id}/databases"
+  #   response_key: databases.database
+  #   cache: true
+  #   permissions_endpoint: "sites/{site_id}/databases/{id}/permissions"
+
+  # tables:
+  #   path: "sites/{site_id}/tables"
+  #   response_key: tables.table
+  #   cache: true
+  #   permissions_endpoint: "sites/{site_id}/tables/{id}/permissions"
+  #   params:
+  #     pageSize: 1000
+
+  # ===========================================================================
+  # COLLECTIONS
+  # ===========================================================================
+
+  collections:
+    path: "-/collections"
+    response_key: items
+    format: json
+    primary_key: luid
+    cache: true
+
+  # ===========================================================================
+  # SUBSCRIPTIONS
+  # ===========================================================================
+
+  subscriptions:
+    path: "sites/{site_id}/subscriptions"
+    response_key: subscriptions.subscription
+    cache: true
+
+  # ===========================================================================
+  # NOTIFICATIONS / ALERTS
+  # ===========================================================================
+
+  data_alerts:
+    path: "sites/{site_id}/dataAlerts"
+    response_key: dataAlerts.dataAlert
+    cache: true
+
+  # ===========================================================================
+  # WEBHOOKS
+  # ===========================================================================
+
+  webhooks:
+    path: "sites/{site_id}/webhooks"
+    response_key: webhooks.webhook
+    cache: true
+    ownership_transferable: true
+
+  # ===========================================================================
+  # PULSE (JSON API — metric definitions and subscriptions)
+  # ===========================================================================
+
+  pulse_definitions:
+    path: "-/pulse/definitions"
+    response_key: definitions
+    format: json
+    cache: true
+    pagination: cursor
+
+  pulse_subscriptions:
+    path: "-/pulse/subscriptions"
+    response_key: subscriptions
+    format: json
+    cache: true
+    pagination: cursor
+
+  pulse_alerts:
+    path: "-/pulse/alerts"
+    response_key: alerts
+    format: json
+    cache: true
+    pagination: cursor
+
+  # ===========================================================================
+  # SCHEDULED TASKS (read-only — for impact reporting)
+  # ===========================================================================
+
+  # extract_refresh_tasks:
+  #   path: "sites/{site_id}/tasks/extractRefreshes"
+  #   response_key: tasks.task
+  #   cache: true
+
+  # flow_run_tasks:
+  #   path: "sites/{site_id}/tasks/runFlow"
+  #   response_key: tasks.task
+  #   cache: true
+
+  # ===========================================================================
+  # FAVORITES
+  # ===========================================================================
+
+  user_favorites:
+    path: "sites/{site_id}/favorites/{user_id}"
+    response_key: favorites.favorite
+    parent: users
+
+  # ===========================================================================
+  # AUTHENTICATION (PATs per user)
+  # ===========================================================================
+
+  user_personal_access_tokens:
+    path: "sites/{site_id}/users/{user_id}/personal-access-tokens"
+    response_key: personalAccessTokens.personalAccessToken
+    parent: users
+
+  # ===========================================================================
+  # PERMISSIONS — child endpoints (require parent IDs)
+  # ===========================================================================
+
+  workbook_permissions:
+    path: "sites/{site_id}/workbooks/{workbook_id}/permissions"
+    response_key: permissions
+    parent: workbooks
+
+  view_permissions:
+    path: "sites/{site_id}/views/{view_id}/permissions"
+    response_key: permissions
+    parent: views
+
+  datasource_permissions:
+    path: "sites/{site_id}/datasources/{datasource_id}/permissions"
+    response_key: permissions
+    parent: datasources
+
+  flow_permissions:
+    path: "sites/{site_id}/flows/{flow_id}/permissions"
+    response_key: permissions
+    parent: flows
+
+  project_permissions:
+    path: "sites/{site_id}/projects/{project_id}/permissions"
+    response_key: permissions
+    parent: projects
+
+  virtual_connection_permissions:
+    path: "sites/{site_id}/virtualconnections/{virtual_connection_luid}/permissions"
+    response_key: permissions
+    parent: virtual_connections
+
+  database_permissions:
+    path: "sites/{site_id}/databases/{database_luid}/permissions"
+    response_key: permissions
+    parent: databases
+
+  table_permissions:
+    path: "sites/{site_id}/tables/{table_id}/permissions"
+    response_key: permissions
+    parent: tables
+
+  collection_permissions:
+    path: "sites/{site_id}/collections/{collection_luid}/permissions"
+    response_key: permissions
+    parent: collections
+
+  # ===========================================================================
+  # DEFAULT PERMISSIONS (per project, per content type)
+  # ===========================================================================
+
+  project_default_permissions_workbooks:
+    path: "sites/{site_id}/projects/{project_luid}/default-permissions/workbooks"
+    response_key: permissions
+    parent: projects
+
+  project_default_permissions_datasources:
+    path: "sites/{site_id}/projects/{project_luid}/default-permissions/datasources"
+    response_key: permissions
+    parent: projects
+
+  project_default_permissions_flows:
+    path: "sites/{site_id}/projects/{project_luid}/default-permissions/flows"
+    response_key: permissions
+    parent: projects
+
+  project_default_permissions_virtualconnections:
+    path: "sites/{site_id}/projects/{project_luid}/default-permissions/virtualconnections"
+    response_key: permissions
+    parent: projects
+
+  project_default_permissions_databases:
+    path: "sites/{site_id}/projects/{project_luid}/default-permissions/databases"
+    response_key: permissions
+    parent: projects
+
+  project_default_permissions_tables:
+    path: "sites/{site_id}/projects/{project_luid}/default-permissions/tables"
+    response_key: permissions
+    parent: projects
+
+  project_default_permissions_metrics:
+    path: "sites/{site_id}/projects/{project_luid}/default-permissions/metrics"
+    response_key: permissions
+    parent: projects
+
+  database_default_permissions:
+    path: "sites/{site_id}/databases/{database_luid}/default-permissions/tables"
+    response_key: permissions
+    parent: databases
+
+
+# =============================================================================
+# DEFAULTS
+# =============================================================================
+defaults:
+  page_size: 100
+  site_scoped: true
+  format: xml

@@ -71,6 +71,7 @@ tableau_user_migrate/
 ├── requirements.txt
 ├── validate_setup.py                # Pre-flight validator
 ├── validate_migration.py            # Post-migration validator
+├── plan_batches.py                  # Batch planning: scores users by complexity, outputs per-batch CSVs
 │
 ├── config/
 │   ├── settings.py                  # Nested dataclass config from .env
@@ -173,6 +174,7 @@ Each service's REST API methods, verified against the Tableau Cloud REST API:
 ### AlertService
 | Operation | Method | Endpoint |
 |-----------|--------|----------|
+| Get alert details (recipients) | GET | `/sites/{site_id}/dataAlerts/{alert_id}` |
 | Add user to alert | POST | `/sites/{site_id}/dataAlerts/{alert_id}/users` |
 | Transfer ownership | PUT | `/sites/{site_id}/dataAlerts/{alert_id}` with `<owner id="..."/>` |
 | Remove user from alert | DELETE | `/sites/{site_id}/dataAlerts/{alert_id}/users/{user_id}` |
@@ -192,6 +194,7 @@ Each service's REST API methods, verified against the Tableau Cloud REST API:
 | Create collection | POST | `/-/collections` | JSON |
 | Get collection items | GET | `/-/collections/{id}/items` | JSON |
 | Add items to collection | POST | `/-/collections/{id}/items` | JSON |
+| Transfer ownership (batch) | POST | `/-/collections/batchUpdate` | XML |
 | Delete collection | DELETE | `/-/collections/{id}` | JSON |
 | Get collection permissions | GET | `/sites/{site_id}/collections/{id}/permissions` | XML |
 | Add collection permissions | PUT | `/sites/{site_id}/collections/{id}/permissions` | XML |
@@ -241,7 +244,9 @@ Services query cache using `get_ids(endpoint, filter_fn)`:
 - `get_child_records(endpoint, parent_id)` — matches `record.attrs["_parent_id"]` (used by groups, favorites)
 
 ### Zero Per-User List Calls
-Every service reads exclusively from cache during workflow execution. Only mutation API calls (POST/PUT/DELETE) hit the server per user. The one exception is `CustomViewService._is_default_for_user()` which makes a targeted GET per custom view to check default user status.
+Every service reads exclusively from cache during workflow execution. Only mutation API calls (POST/PUT/DELETE) hit the server per user. Exceptions:
+- `CustomViewService._is_default_for_user()` — targeted GET per custom view to check default user status
+- `AlertService._get_alert_recipients()` — GET per non-owned alert to check recipient membership during clone
 
 ---
 
@@ -312,36 +317,39 @@ Output: `comparison_report.json` with aggregate deltas, per-user diffs, and anom
 2. clone_permissions (explicit + default)
 3. clone_groups
 4. clone_favorites
-5. clone_subscriptions
-6. clone_alerts (recipient only — ownership not transferable)
-7. clone_custom_views (ownership transfer + default user migration)
+5. clone_subscriptions (creates new via POST)
+6. clone_alerts (add new user as recipient only — no ownership transfer)
+7. clone_custom_views — SKIPPED (no copy API; use migrate mode to transfer)
 8. clone_collections (create new + add items + clone permissions + delete old)
 
 ### Migrate Steps (16)
 1. create_user
 2. clone_permissions (explicit + default)
 3. clone_groups
-4. transfer_ownership (workbooks, datasources, flows, projects, VCs)
-5. clone_favorites
-6. clone_subscriptions
-7. clone_alerts (recipient only)
-8. clone_custom_views (ownership transfer + default user migration)
-9. clone_collections (clone-and-replace)
-10. remove_permissions
-11. remove_groups
-12. remove_favorites
-13. remove_subscriptions
-14. remove_alerts
-15. deactivate (set to Unlicensed)
+4. relocate_personal_space (move to "User Migration Artifacts" project)
+5. transfer_ownership (workbooks, datasources, flows, projects, VCs)
+6. transfer_collections (batchUpdate ownership)
+7. clone_custom_views (ownership transfer + default user migration)
+8. clone_subscriptions (creates new via POST)
+9. clone_alerts (add recipient + transfer ownership + non-owned recipient cloning)
+10. clone_favorites
+11. remove_permissions
+12. remove_groups
+13. remove_favorites
+14. remove_subscriptions
+15. remove_alerts (removes from ALL alerts, not just owned)
+16. deactivate (set to Unlicensed)
 
-### Clean-Only Steps (7)
-1. remove_permissions
-2. remove_groups
-3. remove_favorites
-4. remove_subscriptions
-5. remove_alerts
-6. remove_custom_views
-7. deactivate
+### Clean-Only Steps (9)
+1. relocate_personal_space (move to "User Migration Artifacts" project)
+2. remove_permissions
+3. remove_groups
+4. remove_favorites
+5. remove_subscriptions
+6. remove_alerts (removes from ALL alerts, not just owned)
+7. remove_custom_views
+8. remove_custom_view_defaults
+9. deactivate
 
 ---
 
@@ -506,12 +514,14 @@ Users are sorted by tier (very_high first), then within each tier by **most rece
 
 | Artifact | Limitation | Handling |
 |----------|-----------|----------|
-| **Data alerts** | Ownership transferred via PUT after adding new user as recipient. Retry with backoff on transient failures. |
-| **Collections** | No ownership update endpoint | Clone-and-replace: create new collection, add items, clone permissions, delete old. |
+| **Data alerts** | Ownership transferred via PUT after adding new user as recipient. Retry with backoff on transient failures. In clone mode, only adds recipient (no ownership transfer). Non-owned alert recipient memberships discovered via GET per alert. |
+| **Collections** | Ownership transfer via `POST /-/collections/batchUpdate` (XML format). In clone mode, uses clone-and-replace instead. |
+| **Custom views** | No copy/duplicate API exists. | Ownership transferred in migrate mode. Skipped entirely in clone mode (logged as warning). |
 | **PATs** | Cannot be cloned or transferred (secrets) | Warning in user report. User must recreate. |
 | **Connected App tokens** | Cannot be migrated | Warning in user report. |
 | **OAuth / embedded credentials** | Cannot be cloned via API | Warning in user report. |
-| **Custom view defaults** | Requires per-view API call (not cached) | `GET .../default/users` checked per custom view during clone/migrate. |
+| **Custom view defaults** | Requires per-view API call (not cached) | `GET .../default/users` checked per custom view during migrate. |
+| **Subscriptions** | Cannot update existing subscription's user | Creates new subscription via POST with same subject, content, and schedule. |
 
 ---
 
@@ -525,7 +535,11 @@ python -m src.main --mode clean-only --yes
 python -m src.main --resume-latest
 python -m src.main --mode dry-run --compare-latest    # Compare against previous dry-run
 python -m src.main --mode dry-run --compare 20260420_091546  # Compare against specific run
+python -m src.main --mode migrate --csv data/batches/batch_01.csv --yes  # Override CSV_LOCATION
 python -m src.main --force-refresh
+python plan_batches.py                                # Generate per-batch CSVs from dry-run
+python plan_batches.py --batch-size 15                # Custom batch size
+python plan_batches.py --dry-run-dir audit/migrate_run_20260420_091546  # Specific dry-run
 python validate_setup.py
 ```
 

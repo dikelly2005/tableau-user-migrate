@@ -3,3 +3,7 @@ python-dotenv>=1.0.0
 PyJWT>=2.8.0
 cryptography>=42.0.0
 PyYAML>=6.0
+
+# Testing (install with: pip install -r requirements.txt)
+pytest>=8.0.0
+pytest-asyncio>=0.23.0

@@ -8,6 +8,8 @@ Migrates Tableau Cloud users from one username (email) to another. Because Table
 
 ## Quick Start
 
+> **New here?** Read the full walkthrough: [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md)
+
 ### Prerequisites
 
 - Python 3.10+
@@ -17,6 +19,9 @@ Migrates Tableau Cloud users from one username (email) to another. Because Table
 ### Installation
 
 ```bash
+git clone https://github.com/dikelly2005/tableau-user-migrate.git
+cd tableau-user-migrate
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -45,6 +50,9 @@ python -m src.main --mode clone --yes
 # Full migration (clone + transfer ownership + deactivate old)
 python -m src.main --mode migrate --yes
 
+# Full migration in batches of 50 (recommended for >50 users)
+python -m src.main --mode migrate --yes --batch-size 50
+
 # Strip access and deactivate old users only
 python -m src.main --mode clean-only --yes
 
@@ -53,6 +61,9 @@ python -m src.main --resume-latest
 
 # Compare dry-runs (post-migration verification)
 python -m src.main --mode dry-run --compare-latest
+
+# Rollback a migration
+python -m src.main --rollback ./audit/migrate_run_YYYYMMDD_HHMMSS/audit_log.jsonl
 ```
 
 ---

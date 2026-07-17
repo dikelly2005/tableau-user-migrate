@@ -1,3 +1,5 @@
+# Per-user per-step checkpoint manager for resumable migrations
+# Co-authored with CoCo
 import json
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -108,6 +110,12 @@ class CheckpointManager:
         self._dirty = False
         self.save()
         print_status("CHECKPOINT", f"Failed: {old_username} — {error[:100]}")
+
+    def is_failed(self, old_username: str) -> bool:
+        cp = self._checkpoints.get(old_username)
+        if cp is None:
+            return False
+        return cp.status == CheckpointStatus.FAILED
 
     def mark_step_completed(self, old_username: str, step: str) -> None:
         cp = self._checkpoints.get(old_username)

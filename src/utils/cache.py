@@ -1,3 +1,5 @@
+# Tableau dimension cache with permission refresh support
+# Co-authored with CoCo
 import asyncio
 import json
 import logging
@@ -6,6 +8,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Optional
 
+from src.utils.exceptions import APIError
 from src.utils.logging_config import get_logger, print_status
 from src.utils.paths import resolve_endpoint_path, resolve_element_tag
 
@@ -172,6 +175,11 @@ class DimensionCache:
             "name_field": "label",
             "extra_attrs": ["workbook", "view", "datasource", "project", "flow"],
         },
+        "custom_view_default_users": {
+            "id_fields": ["id"],
+            "name_field": "name",
+            "extra_attrs": ["siteRole"],
+        },
     }
 
     def __init__(
@@ -293,6 +301,14 @@ class DimensionCache:
         else:
             self._dimensions.clear()
             self._created_at = None
+
+    def refresh(self) -> None:
+        record_count = self.total_records
+        perm_count = self.total_permissions
+        self._dimensions.clear()
+        self._permissions.clear()
+        self._created_at = None
+        print_status("CACHE", f"Cleared {record_count} records + {perm_count} permissions for refresh")
 
     def populate_child(
         self,
@@ -498,6 +514,100 @@ class DimensionCache:
             return True
         return datetime.now() - self._created_at > self._ttl
 
+    async def refresh_permissions(self, client=None, endpoints_config: Optional[dict] = None, max_concurrent: int = 10) -> None:
+        """Re-fetch all permission data from the API, clearing stale permission cache."""
+        if not client or not endpoints_config or not self._site_id:
+            self._permissions.clear()
+            print_status("CACHE", "Permission cache cleared (no client available for live refresh)")
+            return
+
+        self._permissions.clear()
+        endpoints = endpoints_config.get("endpoints", {})
+        sem = asyncio.Semaphore(max_concurrent)
+        site_id = self._site_id
+
+        perm_endpoints = {
+            name: cfg for name, cfg in endpoints.items()
+            if cfg.get("parent") and (name.endswith("_permissions") or "default_permissions" in name)
+        }
+
+        if not perm_endpoints:
+            print_status("CACHE", "No permission endpoints configured — skipping refresh")
+            return
+
+        total_perm_records = 0
+
+        locked_project_ids = set()
+        for pid in self.get_ids("projects"):
+            rec = self.get_record("projects", pid)
+            if rec and rec.type and rec.type.lower() in ("lockedtoproject", "lockedtoprojectwithoutnested"):
+                locked_project_ids.add(pid)
+        project_content_parents = {"workbooks", "views", "datasources", "flows"}
+
+        for perm_name, perm_config in perm_endpoints.items():
+            parent_name = perm_config["parent"]
+            if not self.has_dimension(parent_name):
+                continue
+
+            parent_ids = self.get_ids(parent_name)
+            if not parent_ids:
+                continue
+
+            if parent_name in project_content_parents:
+                filtered_ids = []
+                for pid in parent_ids:
+                    rec = self.get_record(parent_name, pid)
+                    if not rec:
+                        filtered_ids.append(pid)
+                        continue
+                    project_attr = rec.attrs.get("project", {})
+                    project_id = project_attr.get("id") if isinstance(project_attr, dict) else None
+                    if not project_id and parent_name == "views":
+                        workbook_attr = rec.attrs.get("workbook", {})
+                        wb_id = workbook_attr.get("id") if isinstance(workbook_attr, dict) else None
+                        if wb_id:
+                            wb_rec = self.get_record("workbooks", wb_id)
+                            if wb_rec:
+                                wb_project = wb_rec.attrs.get("project", {})
+                                project_id = wb_project.get("id") if isinstance(wb_project, dict) else None
+                    if not project_id:
+                        continue
+                    if project_id in locked_project_ids:
+                        continue
+                    filtered_ids.append(pid)
+                parent_ids = filtered_ids
+
+            path_tpl = perm_config["path"]
+            is_default = "default_permissions" in perm_name
+            perm_counts = {"total": 0}
+
+            async def _fetch_perms(pid: str, _path_tpl=path_tpl, _perm_name=perm_name, _is_default=is_default) -> None:
+                async with sem:
+                    placeholders = {
+                        "site_id": site_id,
+                        "workbook_id": pid, "view_id": pid,
+                        "datasource_id": pid, "flow_id": pid,
+                        "project_id": pid, "project_luid": pid,
+                        "virtual_connection_luid": pid,
+                        "database_luid": pid, "table_id": pid,
+                        "collection_luid": pid,
+                    }
+                    try:
+                        raw_path = _path_tpl.format(**{k: v for k, v in placeholders.items() if f"{{{k}}}" in _path_tpl})
+                        api_path = f"/{raw_path}" if not raw_path.startswith("/") else raw_path
+                        root = await client.get(api_path)
+                        grants = self._parse_permission_grants(root)
+                        count = self.populate_permissions(_perm_name, pid, grants, is_default=_is_default)
+                        perm_counts["total"] += count
+                    except Exception as e:
+                        logger.debug(f"Failed to refresh {_perm_name} for {pid}: {e}")
+
+            await asyncio.gather(*[_fetch_perms(pid) for pid in parent_ids])
+            total_perm_records += perm_counts["total"]
+
+        print_status("CACHE", f"Permission cache refreshed: {total_perm_records} grants")
+
+
     async def _enrich_collections(self, client, endpoints_config: dict, site_id: str, sem: asyncio.Semaphore) -> None:
         if not self.has_dimension("collections") or not self.has_dimension("users"):
             return
@@ -519,42 +629,9 @@ class DimensionCache:
         print_status("CACHE", f"Enriched {enriched}/{self.count('collections')} collections with owner data")
 
     async def _enrich_virtual_connections(self, client, site_id: str, sem: asyncio.Semaphore) -> None:
-        if not self.has_dimension("virtual_connections"):
-            return
-
-        vc_ids = self.get_ids("virtual_connections")
-        if not vc_ids:
-            return
-
-        print_status("CACHE", f"Enriching {len(vc_ids)} virtual connections with owner details via revisions...")
-        enriched = {"n": 0}
-
-        async def _fetch_revision(vc_id: str) -> None:
-            async with sem:
-                try:
-                    api_path = f"/sites/{site_id}/virtualconnections/{vc_id}/revisions/?pageSize=1&pageNumber=1"
-                    root = await client.get(api_path)
-                    revisions = self._elements_to_dicts(
-                        [e for e in root.iter()
-                         if (e.tag.split("}")[-1] if "}" in e.tag else e.tag) == "revision"]
-                    )
-                    if revisions:
-                        current = next((r for r in revisions if r.get("current") == "true"), revisions[0])
-                        publisher = current.get("publisher")
-                        if isinstance(publisher, dict):
-                            owner_id = publisher.get("id")
-                            if owner_id:
-                                record = self.get_record("virtual_connections", vc_id)
-                                if record:
-                                    record.attrs["owner"] = {"id": owner_id}
-                                    if publisher.get("name"):
-                                        record.attrs["owner"]["name"] = publisher["name"]
-                                    enriched["n"] += 1
-                except Exception as e:
-                    logger.debug(f"Failed to enrich virtual connection {vc_id}: {e}")
-
-        await asyncio.gather(*[_fetch_revision(vc_id) for vc_id in vc_ids])
-        print_status("CACHE", f"Enriched {enriched['n']}/{len(vc_ids)} virtual connections with owner data")
+        # Skip VC enrichment — the primary list endpoint already returns correct owner data.
+        # The revisions endpoint returns the publisher (whoever last saved), not the current owner.
+        return
 
     async def warmup(self, client, endpoints_config: dict, site_id: str, max_concurrent: int = 10) -> None:
         print_status("CACHE", "Warming dimension cache...")
@@ -577,52 +654,62 @@ class DimensionCache:
                 pk = ep_config.get("primary_key")
                 fmt = ep_config.get("format", "xml")
 
-                try:
-                    if fmt == "json":
-                        json_headers = {"Accept": "application/json", "Content-Type": "application/json"}
-                        rk = ep_config.get("response_key")
-                        use_cursor = ep_config.get("pagination") == "cursor"
+                max_ep_retries = 3
+                for ep_attempt in range(max_ep_retries):
+                    try:
+                        if fmt == "json":
+                            json_headers = {"Accept": "application/json", "Content-Type": "application/json"}
+                            rk = ep_config.get("response_key")
+                            use_cursor = ep_config.get("pagination") == "cursor"
 
-                        if use_cursor:
-                            all_items: list[dict] = []
-                            page_token = None
-                            while True:
-                                paged_path = api_path
-                                sep = "&" if "?" in paged_path else "?"
-                                paged_path += f"{sep}page_size=100"
-                                if page_token:
-                                    paged_path += f"&page_token={page_token}"
-                                response = await client._base.request("GET", paged_path, headers=json_headers)
-                                data = response.json()
-                                page_items = data.get(rk, []) if rk else (data if isinstance(data, list) else [])
-                                if not isinstance(page_items, list):
-                                    page_items = [page_items] if page_items else []
-                                all_items.extend(page_items)
-                                page_token = data.get("next_page_token")
-                                if not page_token:
-                                    break
-                            self.populate(ep_name, all_items, primary_key=pk)
-                        else:
-                            response = await client._base.request("GET", api_path, headers=json_headers)
-                            data = response.json()
-                            if rk:
-                                items = data.get(rk, [])
-                            elif isinstance(data, list):
-                                items = data
+                            if use_cursor:
+                                all_items: list[dict] = []
+                                page_token = None
+                                while True:
+                                    paged_path = api_path
+                                    sep = "&" if "?" in paged_path else "?"
+                                    paged_path += f"{sep}page_size=100"
+                                    if page_token:
+                                        paged_path += f"&page_token={page_token}"
+                                    response = await client._base.request("GET", paged_path, headers=json_headers)
+                                    data = response.json()
+                                    page_items = data.get(rk, []) if rk else (data if isinstance(data, list) else [])
+                                    if not isinstance(page_items, list):
+                                        page_items = [page_items] if page_items else []
+                                    all_items.extend(page_items)
+                                    page_token = data.get("next_page_token")
+                                    if not page_token:
+                                        break
+                                self.populate(ep_name, all_items, primary_key=pk)
                             else:
-                                items = []
-                            if not isinstance(items, list):
-                                items = [items] if items else []
+                                response = await client._base.request("GET", api_path, headers=json_headers)
+                                data = response.json()
+                                if rk:
+                                    items = data.get(rk, [])
+                                elif isinstance(data, list):
+                                    items = data
+                                else:
+                                    items = []
+                                if not isinstance(items, list):
+                                    items = [items] if items else []
+                                self.populate(ep_name, items, primary_key=pk)
+                        else:
+                            elements = await client.paginate_items(api_path, element_tag)
+                            items = self._elements_to_dicts(elements)
                             self.populate(ep_name, items, primary_key=pk)
-                    else:
-                        elements = await client.paginate_items(api_path, element_tag)
-                        items = self._elements_to_dicts(elements)
-                        self.populate(ep_name, items, primary_key=pk)
-                except Exception as e:
-                    logger.warning(f"Failed to cache {ep_name}: {e}")
-                finally:
-                    completed["n"] += 1
-                    print_status("CACHE", f"[{completed['n']}/{total_primary}] {ep_name} done")
+                        break
+                    except APIError as e:
+                        if e.status_code in (401, 429, 500, 502, 503, 504) and ep_attempt < max_ep_retries - 1:
+                            wait = 2 ** ep_attempt
+                            logger.warning(f"Retrying {ep_name} after {e.status_code} (attempt {ep_attempt + 1}/{max_ep_retries})")
+                            await asyncio.sleep(wait)
+                            continue
+                        logger.warning(f"Failed to cache {ep_name}: {e}")
+                    except Exception as e:
+                        logger.warning(f"Failed to cache {ep_name}: {e}")
+                        break
+                completed["n"] += 1
+                print_status("CACHE", f"[{completed['n']}/{total_primary}] {ep_name} done")
 
         await asyncio.gather(*[
             _fetch_primary(name, cfg) for name, cfg in primary.items()
@@ -657,6 +744,7 @@ class DimensionCache:
                             "site_id": site_id,
                             "user_id": pid,
                             "group_id": pid,
+                            "custom_view_id": pid,
                         }
                         raw_path = path_tpl.format(**{k: v for k, v in placeholders.items() if f"{{{k}}}" in path_tpl})
                         api_path = f"/{raw_path}" if not raw_path.startswith("/") else raw_path
@@ -696,6 +784,23 @@ class DimensionCache:
             print_status("CACHE", f"Building permission table ({len(all_perm_endpoints)} permission types)...")
             total_perm_records = 0
 
+            locked_project_ids = set()
+            for pid in self.get_ids("projects"):
+                rec = self.get_record("projects", pid)
+                if rec and rec.type and rec.type.lower() in ("lockedtoproject", "lockedtoprojectwithoutnested"):
+                    locked_project_ids.add(pid)
+            if locked_project_ids:
+                print_status("CACHE", f"Found {len(locked_project_ids)} locked projects — skipping content permission scans for their children")
+            else:
+                all_types = set()
+                for pid in self.get_ids("projects"):
+                    rec = self.get_record("projects", pid)
+                    if rec and rec.type:
+                        all_types.add(rec.type)
+                print_status("CACHE", f"Project contentPermissions types found: {all_types or 'none'}")
+
+            project_content_parents = {"workbooks", "views", "datasources", "flows"}
+
             for perm_name, perm_config in all_perm_endpoints.items():
                 parent_name = perm_config["parent"]
                 if not self.has_dimension(parent_name):
@@ -704,6 +809,34 @@ class DimensionCache:
                 parent_ids = self.get_ids(parent_name)
                 if not parent_ids:
                     continue
+
+                if parent_name in project_content_parents:
+                    original_count = len(parent_ids)
+                    filtered_ids = []
+                    for pid in parent_ids:
+                        rec = self.get_record(parent_name, pid)
+                        if not rec:
+                            filtered_ids.append(pid)
+                            continue
+                        project_attr = rec.attrs.get("project", {})
+                        project_id = project_attr.get("id") if isinstance(project_attr, dict) else None
+                        if not project_id and parent_name == "views":
+                            workbook_attr = rec.attrs.get("workbook", {})
+                            wb_id = workbook_attr.get("id") if isinstance(workbook_attr, dict) else None
+                            if wb_id:
+                                wb_rec = self.get_record("workbooks", wb_id)
+                                if wb_rec:
+                                    wb_project = wb_rec.attrs.get("project", {})
+                                    project_id = wb_project.get("id") if isinstance(wb_project, dict) else None
+                        if not project_id:
+                            continue
+                        if project_id in locked_project_ids:
+                            continue
+                        filtered_ids.append(pid)
+                    skipped = original_count - len(filtered_ids)
+                    if skipped:
+                        print_status("CACHE", f"Skipping {skipped}/{original_count} {parent_name} (locked projects + Personal Space) for {perm_name}")
+                    parent_ids = filtered_ids
 
                 path_tpl = perm_config["path"]
                 is_default = "default_permissions" in perm_name

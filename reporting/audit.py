@@ -1,4 +1,8 @@
+# Tableau migration audit logger with optional PII redaction
+# Co-authored with CoCo
+import hashlib
 import json
+import re
 import threading
 from pathlib import Path
 from datetime import datetime, timezone
@@ -49,6 +53,7 @@ class AuditAction(Enum):
     CLEANUP_START = "CLEANUP_START"
     CLEANUP_COMPLETE = "CLEANUP_COMPLETE"
 
+    DEACTIVATE_USER = "DEACTIVATE_USER"
     ERROR = "ERROR"
     RETRY = "RETRY"
 
@@ -59,6 +64,23 @@ class AuditResult(Enum):
     SKIPPED = "SKIPPED"
     WARNING = "WARNING"
     RETRY_SCHEDULED = "RETRY_SCHEDULED"
+
+
+_EMAIL_PATTERN = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+")
+
+
+def _hash_email(email: str) -> str:
+    return hashlib.sha256(email.lower().encode()).hexdigest()[:12]
+
+
+def _redact_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _EMAIL_PATTERN.sub(lambda m: _hash_email(m.group(0)), value)
+    if isinstance(value, dict):
+        return {k: _redact_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_value(v) for v in value]
+    return value
 
 
 class AuditLogger:
@@ -76,9 +98,10 @@ class AuditLogger:
         "details",
     )
 
-    def __init__(self, audit_file: Path, run_id: str):
+    def __init__(self, audit_file: Path, run_id: str, redact_pii: bool = False):
         self.audit_file = audit_file
         self.run_id = run_id
+        self._redact_pii = redact_pii
         self._lock = threading.Lock()
 
         self.audit_file.parent.mkdir(parents=True, exist_ok=True)
@@ -123,6 +146,9 @@ class AuditLogger:
         for key, value in optional.items():
             if value is not None:
                 event[key] = value
+
+        if self._redact_pii:
+            event = _redact_value(event)
 
         ordered = {k: event[k] for k in self._FIELD_ORDER if k in event}
         for k, v in event.items():
@@ -179,11 +205,13 @@ class AuditLogger:
         new_username: Optional[str] = None,
         object_type: Optional[str] = None,
         object_name: Optional[str] = None,
+        object_id: Optional[str] = None,
     ) -> None:
         self.log(
             action=action, result=AuditResult.SKIPPED,
             old_username=old_username, new_username=new_username,
             object_type=object_type, object_name=object_name,
+            object_id=object_id,
             details={"reason": reason},
         )
 

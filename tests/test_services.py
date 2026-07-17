@@ -1,9 +1,9 @@
 import asyncio
 import unittest
 import xml.etree.ElementTree as ET
+import tempfile
 from unittest.mock import AsyncMock, MagicMock, patch, call
 from pathlib import Path
-from tempfile import TemporaryDirectory
 
 from src.utils.cache import DimensionCache, DimensionRecord
 from models.impact import UXArtifact
@@ -16,11 +16,25 @@ NEW_USER_ID = "new-user-222"
 OLD_USERNAME = "old@example.com"
 NEW_USERNAME = "new@example.com"
 
+_ENDPOINTS_CONFIG = {
+    "endpoints": {
+        "user_favorites": {"path": "sites/{site_id}/favorites/{user_id}"},
+        "user_favorite_single": {"path": "sites/{site_id}/favorites/{user_id}/{content_type}/{content_id}"},
+        "custom_view_single": {"path": "sites/{site_id}/customviews/{custom_view_id}"},
+        "custom_view_default_users": {"path": "sites/{site_id}/customviews/{custom_view_id}/default/users"},
+        "custom_view_default_user_single": {"path": "sites/{site_id}/customviews/{custom_view_id}/default/users/{user_id}"},
+        "data_alerts": {"path": "sites/{site_id}/dataAlerts"},
+        "data_alert_single": {"path": "sites/{site_id}/dataAlerts/{alert_id}"},
+        "data_alert_users": {"path": "sites/{site_id}/dataAlerts/{alert_id}/users"},
+        "data_alert_user_single": {"path": "sites/{site_id}/dataAlerts/{alert_id}/users/{user_id}"},
+    }
+}
+
 
 def _make_audit_logger():
-    with TemporaryDirectory() as tmp:
-        path = Path(tmp) / "audit.jsonl"
-        return AuditLogger(path, "test-run")
+    tmp = tempfile.mkdtemp()
+    path = Path(tmp) / "audit.jsonl"
+    return AuditLogger(path, "test-run")
 
 
 def _make_mock_client():
@@ -50,9 +64,9 @@ class TestFavoriteServiceHTTPVerbs(unittest.TestCase):
             ),
         }
         audit = _make_audit_logger()
-        svc = FavoriteService(client, audit, cache)
+        svc = FavoriteService(client, audit, cache, _ENDPOINTS_CONFIG)
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             svc.clone_favorites(OLD_USER_ID, OLD_USERNAME, NEW_USER_ID, NEW_USERNAME)
         )
 
@@ -81,9 +95,9 @@ class TestFavoriteServiceHTTPVerbs(unittest.TestCase):
             ),
         }
         audit = _make_audit_logger()
-        svc = FavoriteService(client, audit, cache)
+        svc = FavoriteService(client, audit, cache, _ENDPOINTS_CONFIG)
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             svc.remove_favorites(OLD_USER_ID, OLD_USERNAME)
         )
 
@@ -117,9 +131,9 @@ class TestCustomViewServiceHTTPVerbs(unittest.TestCase):
         client.get.return_value = ET.fromstring(f'<tsResponse xmlns="http://tableau.com/api"><users></users></tsResponse>')
         cache = self._setup_cache_with_cv()
         audit = _make_audit_logger()
-        svc = CustomViewService(client, audit, cache)
+        svc = CustomViewService(client, audit, cache, _ENDPOINTS_CONFIG)
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             svc.clone_custom_views(OLD_USER_ID, OLD_USERNAME, NEW_USER_ID, NEW_USERNAME)
         )
 
@@ -143,9 +157,9 @@ class TestCustomViewServiceHTTPVerbs(unittest.TestCase):
         client.get.return_value = default_xml
         cache = self._setup_cache_with_cv()
         audit = _make_audit_logger()
-        svc = CustomViewService(client, audit, cache)
+        svc = CustomViewService(client, audit, cache, _ENDPOINTS_CONFIG)
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             svc.clone_custom_views(OLD_USER_ID, OLD_USERNAME, NEW_USER_ID, NEW_USERNAME)
         )
 
@@ -170,9 +184,9 @@ class TestCustomViewServiceHTTPVerbs(unittest.TestCase):
         client.get.return_value = empty_xml
         cache = self._setup_cache_with_cv()
         audit = _make_audit_logger()
-        svc = CustomViewService(client, audit, cache)
+        svc = CustomViewService(client, audit, cache, _ENDPOINTS_CONFIG)
 
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             svc.clone_custom_views(OLD_USER_ID, OLD_USERNAME, NEW_USER_ID, NEW_USERNAME)
         )
 
@@ -202,9 +216,9 @@ class TestAlertServiceHTTPVerbs(unittest.TestCase):
         client = _make_mock_client()
         cache = self._setup_cache_with_alert()
         audit = _make_audit_logger()
-        svc = AlertService(client, audit, cache)
+        svc = AlertService(client, audit, cache, _ENDPOINTS_CONFIG)
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             svc.clone_alerts(OLD_USER_ID, OLD_USERNAME, NEW_USER_ID, NEW_USERNAME)
         )
 
@@ -230,9 +244,9 @@ class TestAlertServiceHTTPVerbs(unittest.TestCase):
         client.post.side_effect = APIError("409 Conflict", status_code=409)
         cache = self._setup_cache_with_alert()
         audit = _make_audit_logger()
-        svc = AlertService(client, audit, cache)
+        svc = AlertService(client, audit, cache, _ENDPOINTS_CONFIG)
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             svc.clone_alerts(OLD_USER_ID, OLD_USERNAME, NEW_USER_ID, NEW_USERNAME)
         )
 
@@ -247,9 +261,9 @@ class TestAlertServiceHTTPVerbs(unittest.TestCase):
         client.put.side_effect = APIError("403 Forbidden", status_code=403)
         cache = self._setup_cache_with_alert()
         audit = _make_audit_logger()
-        svc = AlertService(client, audit, cache)
+        svc = AlertService(client, audit, cache, _ENDPOINTS_CONFIG)
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             svc.clone_alerts(OLD_USER_ID, OLD_USERNAME, NEW_USER_ID, NEW_USERNAME)
         )
 
@@ -264,9 +278,9 @@ class TestAlertServiceHTTPVerbs(unittest.TestCase):
         client = _make_mock_client()
         cache = self._setup_cache_with_alert()
         audit = _make_audit_logger()
-        svc = AlertService(client, audit, cache)
+        svc = AlertService(client, audit, cache, _ENDPOINTS_CONFIG)
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             svc.remove_alerts(OLD_USER_ID, OLD_USERNAME)
         )
 
@@ -286,9 +300,9 @@ class TestAlertServiceHTTPVerbs(unittest.TestCase):
         ]
         cache = self._setup_cache_with_alert()
         audit = _make_audit_logger()
-        svc = AlertService(client, audit, cache)
+        svc = AlertService(client, audit, cache, _ENDPOINTS_CONFIG)
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             svc.clone_alerts(OLD_USER_ID, OLD_USERNAME, NEW_USER_ID, NEW_USERNAME)
         )
 
@@ -303,9 +317,9 @@ class TestAlertServiceHTTPVerbs(unittest.TestCase):
         client.post.side_effect = APIError("500 Server Error", status_code=500)
         cache = self._setup_cache_with_alert()
         audit = _make_audit_logger()
-        svc = AlertService(client, audit, cache)
+        svc = AlertService(client, audit, cache, _ENDPOINTS_CONFIG)
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             svc.clone_alerts(OLD_USER_ID, OLD_USERNAME, NEW_USER_ID, NEW_USERNAME)
         )
 

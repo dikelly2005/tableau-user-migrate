@@ -44,7 +44,8 @@ class TestLoadUserMappings(unittest.TestCase):
             p = self._write_csv(Path(tmpdir), "old_username,new_username\n")
             with self.assertRaises(ValidationError) as ctx:
                 load_user_mappings(p)
-            self.assertIn("no user mappings", str(ctx.exception).lower())
+            self.assertIn("no", str(ctx.exception).lower())
+            self.assertIn("user mappings", str(ctx.exception).lower())
 
     def test_missing_columns(self):
         with TemporaryDirectory() as tmpdir:

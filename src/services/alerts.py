@@ -1,8 +1,11 @@
+# Tableau data alert cloning and removal service
+# Co-authored with CoCo
 import asyncio
 from typing import List
 
 from src.api.client import TableauAPIClient, _findall_any, _find_any
 from src.utils.cache import DimensionCache, owner_filter
+from src.utils.paths import resolve_endpoint_path
 from src.utils.exceptions import APIError
 from models.impact import UXArtifact
 from reporting.audit import AuditLogger, AuditAction
@@ -15,10 +18,17 @@ _RETRY_BACKOFF_BASE = 1.0
 
 
 class AlertService:
-    def __init__(self, client: TableauAPIClient, audit: AuditLogger, cache: DimensionCache):
+    def __init__(self, client: TableauAPIClient, audit: AuditLogger, cache: DimensionCache, endpoints_config: dict):
         self._client = client
         self._audit = audit
         self._cache = cache
+        self._endpoints = endpoints_config.get("endpoints", {})
+
+    def _resolve_path(self, endpoint_name: str, **kwargs) -> str:
+        ep_config = self._endpoints.get(endpoint_name)
+        if not ep_config:
+            raise ValueError(f"Unknown endpoint: {endpoint_name}")
+        return resolve_endpoint_path(ep_config["path"], self._client.site_id, **kwargs)
 
     async def get_user_alerts(self, user_id: str, username: str) -> List[UXArtifact]:
         alert_ids = self._cache.get_ids("data_alerts", filter_fn=owner_filter(user_id))
@@ -75,19 +85,35 @@ class AlertService:
                 raise
         return False
 
+    async def _get_alert_recipients(self, alert_id: str) -> List[str]:
+        endpoint = self._resolve_path("data_alert_single", alert_id=alert_id)
+        try:
+            root = await self._client.get(endpoint)
+            recipients = []
+            for recipient_el in _findall_any(root, "recipient"):
+                rid = recipient_el.get("id")
+                if rid:
+                    recipients.append(rid)
+            return recipients
+        except Exception as e:
+            logger.warning(f"Failed to get recipients for alert {alert_id}: {e}")
+            return []
+
     async def clone_alerts(
         self,
         old_user_id: str,
         old_username: str,
         new_user_id: str,
         new_username: str,
+        transfer_ownership: bool = True,
     ) -> int:
         print_status("START", f"Cloning alerts: {old_username} -> {new_username}")
-        alerts = await self.get_user_alerts(old_user_id, old_username)
+        owned_alerts = await self.get_user_alerts(old_user_id, old_username)
+        owned_alert_ids = {a.artifact_id for a in owned_alerts}
         cloned = 0
 
-        for alert in alerts:
-            recipient_endpoint = f"/sites/{self._client.site_id}/dataAlerts/{alert.artifact_id}/users"
+        for alert in owned_alerts:
+            recipient_endpoint = self._resolve_path("data_alert_users", alert_id=alert.artifact_id)
             recipient_payload = f'<tsRequest><user id="{new_user_id}"/></tsRequest>'
 
             try:
@@ -102,51 +128,94 @@ class AlertService:
                 )
                 continue
 
-            transfer_endpoint = f"/sites/{self._client.site_id}/dataAlerts/{alert.artifact_id}"
-            transfer_payload = (
-                f'<tsRequest><dataAlert>'
-                f'<owner id="{new_user_id}"/>'
-                f'</dataAlert></tsRequest>'
-            )
-            try:
-                await self._client.put(transfer_endpoint, transfer_payload)
-                cloned += 1
+            if transfer_ownership:
+                transfer_endpoint = self._resolve_path("data_alert_single", alert_id=alert.artifact_id)
+                transfer_payload = (
+                    f'<tsRequest><dataAlert>'
+                    f'<owner id="{new_user_id}"/>'
+                    f'</dataAlert></tsRequest>'
+                )
+                try:
+                    await self._client.put(transfer_endpoint, transfer_payload)
+                    self._audit.log_success(
+                        AuditAction.CLONE_ALERT,
+                        old_username=old_username,
+                        new_username=new_username,
+                        object_type="alert",
+                        object_id=alert.artifact_id,
+                        details={"ownership_transferred": True},
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to transfer alert ownership {alert.artifact_id}: {e}")
+                    self._audit.log_failure(
+                        AuditAction.CLONE_ALERT,
+                        error_message=f"Added as recipient but ownership transfer failed: {e}",
+                        old_username=old_username,
+                        new_username=new_username,
+                        object_id=alert.artifact_id,
+                    )
+            else:
                 self._audit.log_success(
                     AuditAction.CLONE_ALERT,
                     old_username=old_username,
                     new_username=new_username,
                     object_type="alert",
                     object_id=alert.artifact_id,
-                    details={"ownership_transferred": True},
+                    details={"recipient_only": True, "ownership_kept_by_old_user": True},
                 )
-            except Exception as e:
-                logger.warning(f"Failed to transfer alert ownership {alert.artifact_id}: {e}")
-                self._audit.log_failure(
+            cloned += 1
+
+        all_alert_ids = self._cache.get_ids("data_alerts")
+        non_owned_ids = [aid for aid in all_alert_ids if aid not in owned_alert_ids]
+        if non_owned_ids:
+            print_status("INFO", f"Checking {len(non_owned_ids)} non-owned alerts for recipient membership")
+        for aid in non_owned_ids:
+            recipients = await self._get_alert_recipients(aid)
+            if old_user_id not in recipients:
+                continue
+            recipient_endpoint = self._resolve_path("data_alert_users", alert_id=aid)
+            recipient_payload = f'<tsRequest><user id="{new_user_id}"/></tsRequest>'
+            try:
+                await self._add_recipient_with_retry(recipient_endpoint, recipient_payload, aid)
+                cloned += 1
+                record = self._cache.get_record("data_alerts", aid)
+                self._audit.log_success(
                     AuditAction.CLONE_ALERT,
-                    error_message=f"Added as recipient but ownership transfer failed: {e}",
                     old_username=old_username,
                     new_username=new_username,
-                    object_id=alert.artifact_id,
+                    object_type="alert",
+                    object_id=aid,
+                    details={"recipient_only": True, "subject": record.name if record else None},
                 )
-                cloned += 1
+            except Exception as e:
+                logger.warning(f"Failed to add new user as recipient to alert {aid}: {e}")
+                self._audit.log_failure(
+                    AuditAction.CLONE_ALERT,
+                    error_message=str(e),
+                    new_username=new_username,
+                    object_id=aid,
+                    details={"recipient_only": True},
+                )
 
         print_status("DONE", f"Cloned {cloned} alerts for {new_username}")
         return cloned
 
     async def remove_alerts(self, user_id: str, username: str) -> int:
         print_status("START", f"Removing alerts from {username}")
-        alerts = await self.get_user_alerts(user_id, username)
+        all_alert_ids = self._cache.get_ids("data_alerts")
         removed = 0
 
-        for alert in alerts:
-            endpoint = f"/sites/{self._client.site_id}/dataAlerts/{alert.artifact_id}/users/{user_id}"
+        for aid in all_alert_ids:
+            endpoint = self._resolve_path("data_alert_user_single", alert_id=aid, user_id=user_id)
             try:
                 await self._client.delete(endpoint)
                 removed += 1
-                self._audit.log_success(AuditAction.REMOVE_ALERT, old_username=username, object_type="alert", object_id=alert.artifact_id)
+                self._audit.log_success(AuditAction.REMOVE_ALERT, old_username=username, object_type="alert", object_id=aid)
             except Exception as e:
-                logger.warning(f"Failed to remove alert recipient: {e}")
-                self._audit.log_failure(AuditAction.REMOVE_ALERT, error_message=str(e), old_username=username, object_id=alert.artifact_id)
+                if "404" in str(e) or "Not Found" in str(e):
+                    continue
+                logger.warning(f"Failed to remove alert recipient from {aid}: {e}")
+                self._audit.log_failure(AuditAction.REMOVE_ALERT, error_message=str(e), old_username=username, object_id=aid)
 
-        print_status("DONE", f"Removed {removed} alerts from {username}")
+        print_status("DONE", f"Removed {removed} alert memberships from {username}")
         return removed

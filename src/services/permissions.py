@@ -1,3 +1,5 @@
+# Tableau permission cloning service with cache staleness protection
+# Co-authored with CoCo
 import asyncio
 from typing import List, Dict
 
@@ -8,6 +10,9 @@ from reporting.audit import AuditLogger, AuditAction
 from src.utils.logging_config import get_logger, print_status
 
 logger = get_logger(__name__)
+
+# C3 fix: Max users per batch before forcing a cache refresh to prevent stale permission data
+PERMISSION_BATCH_LIMIT = 50
 
 _DEFAULT_PERM_CONTENT_TYPES = (
     "project_default_permissions_workbooks",
@@ -33,6 +38,19 @@ class PermissionService:
         self._audit = audit
         self._cache = cache
         self._endpoints = endpoints_config.get("endpoints", {})
+        self._endpoints_config = endpoints_config
+        self._users_processed = 0
+
+    async def check_cache_staleness(self) -> None:
+        """C3 fix: Refresh permission cache after processing PERMISSION_BATCH_LIMIT users."""
+        self._users_processed += 1
+        if self._users_processed >= PERMISSION_BATCH_LIMIT:
+            print_status("CACHE", f"Refreshing permission cache after {self._users_processed} users")
+            await self._cache.refresh_permissions(
+                client=self._client,
+                endpoints_config=self._endpoints_config,
+            )
+            self._users_processed = 0
 
     def _is_tabbed_workbook_view(self, content_type: str, content_id: str) -> bool:
         if content_type != "view_permissions":
@@ -104,8 +122,14 @@ class PermissionService:
         defaults = await self.get_user_default_permissions(old_user_id, old_username)
         all_perms = explicit + defaults
 
+        # Filter out InheritedProjectLeader — these are auto-granted when project ownership transfers
+        filtered_perms = [p for p in all_perms if p.get("capability_name") != "InheritedProjectLeader"]
+        skipped_inherited = len(all_perms) - len(filtered_perms)
+        if skipped_inherited:
+            print_status("SKIP", f"Skipping {skipped_inherited} InheritedProjectLeader permissions (auto-granted on ownership transfer)")
+
         grouped: Dict[str, List[Dict]] = {}
-        for p in all_perms:
+        for p in filtered_perms:
             key = f"{p['content_type']}:{p['content_id']}"
             grouped.setdefault(key, []).append(p)
 
@@ -159,6 +183,26 @@ class PermissionService:
                                 new_username=new_username,
                                 object_type=content_type,
                             )
+                    elif "403" in str(e) or "Forbidden" in str(e):
+                        if self._is_locked_project_content(content_type, content_id):
+                            for p in perm_list:
+                                self._audit.log_skipped(
+                                    action,
+                                    reason="Content in locked project — permissions inherited from project",
+                                    new_username=new_username,
+                                    object_type=content_type,
+                                    object_id=content_id,
+                                )
+                        else:
+                            logger.warning(f"Failed to clone permissions on {content_type}/{content_id}: {e}")
+                            for p in perm_list:
+                                self._audit.log_failure(
+                                    action,
+                                    error_message=str(e),
+                                    new_username=new_username,
+                                    object_type=content_type,
+                                    object_id=content_id,
+                                )
                     else:
                         logger.warning(f"Failed to clone permissions on {content_type}/{content_id}: {e}")
                         for p in perm_list:
@@ -184,6 +228,7 @@ class PermissionService:
 
         sem = asyncio.Semaphore(max_concurrent)
         removed = {"n": 0}
+        locked_skipped = {"n": 0}
 
         async def _remove_perm(p: Dict) -> None:
             async with sem:
@@ -205,6 +250,17 @@ class PermissionService:
                         details={"capability": p["capability_name"]},
                     )
                 except Exception as e:
+                    if "403" in str(e) or "Forbidden" in str(e):
+                        if self._is_locked_project_content(p["content_type"], p["content_id"]):
+                            locked_skipped["n"] += 1
+                            self._audit.log_skipped(
+                                action,
+                                reason="Content in locked project — permissions managed at project level",
+                                old_username=username,
+                                object_type=p["content_type"],
+                                object_id=p["content_id"],
+                            )
+                            return
                     logger.warning(f"Failed to remove permission: {e}")
                     self._audit.log_failure(
                         action,
@@ -217,6 +273,8 @@ class PermissionService:
         print_status("DELETE", f"Removing {len(all_perms)} permissions ({max_concurrent} concurrent)...")
         await asyncio.gather(*[_remove_perm(p) for p in all_perms])
 
+        if locked_skipped["n"]:
+            print_status("SKIP", f"Skipped {locked_skipped['n']} permissions in locked projects for {username}")
         print_status("DONE", f"Removed {removed['n']} permissions from {username}")
         return removed["n"]
 
@@ -251,3 +309,46 @@ class PermissionService:
             return resolve_endpoint_path(resolved, self._client.site_id)
         except KeyError:
             return None
+
+    def _is_locked_project_content(self, content_type: str, content_id: str) -> bool:
+        base_type = content_type.replace("_permissions", "")
+        endpoint_map = {
+            "workbook": "workbooks",
+            "view": "views",
+            "datasource": "datasources",
+            "flow": "flows",
+        }
+        cache_key = endpoint_map.get(base_type)
+        if not cache_key:
+            return False
+
+        record = self._cache.get_record(cache_key, content_id)
+        if not record:
+            return False
+
+        project_id = self._resolve_project_id(record, cache_key)
+        if not project_id:
+            return False
+
+        project_record = self._cache.get_record("projects", project_id)
+        if not project_record:
+            return False
+
+        content_perms = project_record.type or ""
+        return content_perms in ("LockedToProject", "LockedToProjectWithoutNested")
+
+    def _resolve_project_id(self, record, cache_key: str) -> str | None:
+        project_info = record.attrs.get("project")
+        if isinstance(project_info, dict) and project_info.get("id"):
+            return project_info["id"]
+
+        if cache_key == "views":
+            wb_info = record.attrs.get("workbook")
+            if isinstance(wb_info, dict) and wb_info.get("id"):
+                wb_record = self._cache.get_record("workbooks", wb_info["id"])
+                if wb_record:
+                    wb_project = wb_record.attrs.get("project")
+                    if isinstance(wb_project, dict):
+                        return wb_project.get("id")
+
+        return None

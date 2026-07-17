@@ -1,7 +1,10 @@
+# Tableau group membership cloning and removal service
+# Co-authored with CoCo
 from typing import List, Dict
 
 from src.api.client import TableauAPIClient
 from src.utils.cache import DimensionCache
+from src.utils.paths import resolve_endpoint_path
 from reporting.audit import AuditLogger, AuditAction
 from src.utils.logging_config import get_logger, print_status
 
@@ -9,10 +12,17 @@ logger = get_logger(__name__)
 
 
 class GroupService:
-    def __init__(self, client: TableauAPIClient, audit: AuditLogger, cache: DimensionCache):
+    def __init__(self, client: TableauAPIClient, audit: AuditLogger, cache: DimensionCache, endpoints_config: dict):
         self._client = client
         self._audit = audit
         self._cache = cache
+        self._endpoints = endpoints_config.get("endpoints", {})
+
+    def _resolve_path(self, endpoint_name: str, **kwargs) -> str:
+        ep_config = self._endpoints.get(endpoint_name)
+        if not ep_config:
+            raise ValueError(f"Unknown endpoint: {endpoint_name}")
+        return resolve_endpoint_path(ep_config["path"], self._client.site_id, **kwargs)
 
     async def get_user_groups(self, user_id: str, username: str) -> List[Dict]:
         records = self._cache.get_parents_for_child("group_users", user_id)
@@ -28,7 +38,7 @@ class GroupService:
             groups.append({"id": group_id, "name": group_name})
 
         if not groups and not self._cache.has_dimension("group_users"):
-            endpoint = f"/sites/{self._client.site_id}/users/{user_id}/groups"
+            endpoint = self._resolve_path("user_groups", user_id=user_id)
             elements = await self._client.paginate_items(endpoint, "group")
             groups = [
                 {"id": e.get("id"), "name": e.get("name")}
@@ -40,7 +50,7 @@ class GroupService:
         return groups
 
     async def add_user_to_group(self, group_id: str, user_id: str, username: str, group_name: str) -> None:
-        endpoint = f"/sites/{self._client.site_id}/groups/{group_id}/users"
+        endpoint = self._resolve_path("group_users", group_id=group_id)
         payload = f'<tsRequest><user id="{user_id}"/></tsRequest>'
 
         try:
@@ -54,7 +64,7 @@ class GroupService:
                 raise
 
     async def remove_user_from_group(self, group_id: str, user_id: str, username: str, group_name: str) -> None:
-        endpoint = f"/sites/{self._client.site_id}/groups/{group_id}/users/{user_id}"
+        endpoint = self._resolve_path("group_user_single", group_id=group_id, user_id=user_id)
         try:
             await self._client.delete(endpoint)
             self._audit.log_success(AuditAction.REMOVE_FROM_GROUP, old_username=username, object_type="group", object_name=group_name, object_id=group_id)

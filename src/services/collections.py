@@ -1,8 +1,11 @@
+# Tableau user migration - collection cloning with safety checks
+# Co-authored with CoCo
 import json
 from typing import List, Dict, Optional
 
 from src.api.client import TableauAPIClient, _findall_any
 from src.utils.cache import DimensionCache, owner_filter
+from src.utils.paths import resolve_endpoint_path
 from reporting.audit import AuditLogger, AuditAction
 from src.utils.logging_config import get_logger, print_status
 
@@ -15,10 +18,18 @@ class CollectionService:
         client: TableauAPIClient,
         audit: AuditLogger,
         cache: DimensionCache,
+        endpoints_config: dict,
     ):
         self._client = client
         self._audit = audit
         self._cache = cache
+        self._endpoints = endpoints_config.get("endpoints", {})
+
+    def _resolve_path(self, endpoint_name: str, **kwargs) -> str:
+        ep_config = self._endpoints.get(endpoint_name)
+        if not ep_config:
+            raise ValueError(f"Unknown endpoint: {endpoint_name}")
+        return resolve_endpoint_path(ep_config["path"], self._client.site_id, **kwargs)
 
     def get_user_collections(self, user_id: str, username: str) -> List[Dict]:
         collection_ids = self._cache.get_ids("collections", filter_fn=owner_filter(user_id))
@@ -34,7 +45,7 @@ class CollectionService:
         return collections
 
     async def _get_collection_items(self, collection_luid: str) -> List[Dict]:
-        endpoint = f"/-/collections/{collection_luid}/items"
+        endpoint = self._resolve_path("collection_items", collection_luid=collection_luid)
         response = await self._client._base.request(
             "GET", endpoint,
             headers={"Accept": "application/json", "Content-Type": "application/json"},
@@ -43,7 +54,7 @@ class CollectionService:
         return data.get("items", [])
 
     async def _create_collection(self, name: str, description: Optional[str] = None) -> Dict:
-        endpoint = "/-/collections"
+        endpoint = self._resolve_path("collections")
         payload = {"name": name}
         if description:
             payload["description"] = description
@@ -57,7 +68,7 @@ class CollectionService:
     async def _add_collection_items(self, collection_luid: str, items: List[Dict]) -> int:
         if not items:
             return 0
-        endpoint = f"/-/collections/{collection_luid}/items"
+        endpoint = self._resolve_path("collection_items", collection_luid=collection_luid)
         added = 0
         for item in items:
             item_type = item.get("type") or item.get("contentType")
@@ -83,7 +94,7 @@ class CollectionService:
         return added
 
     async def _get_collection_permissions(self, collection_luid: str) -> List[Dict]:
-        endpoint = f"/sites/{self._client.site_id}/collections/{collection_luid}/permissions"
+        endpoint = self._resolve_path("collection_permissions", collection_luid=collection_luid)
         root = await self._client.get(endpoint)
         grants = []
         for grant_el in _findall_any(root, "granteeCapabilities"):
@@ -116,7 +127,7 @@ class CollectionService:
         capability_name: str,
         capability_mode: str,
     ) -> None:
-        endpoint = f"/sites/{self._client.site_id}/collections/{collection_luid}/permissions"
+        endpoint = self._resolve_path("collection_permissions", collection_luid=collection_luid)
         if user_id:
             grantee = f'<user id="{user_id}"/>'
         elif group_id:
@@ -162,7 +173,7 @@ class CollectionService:
         return cloned
 
     async def _delete_collection(self, collection_luid: str) -> None:
-        endpoint = f"/-/collections/{collection_luid}"
+        endpoint = self._resolve_path("collection_single", collection_luid=collection_luid)
         await self._client._base.request(
             "DELETE", endpoint,
             headers={"Accept": "application/json", "Content-Type": "application/json"},
@@ -189,6 +200,23 @@ class CollectionService:
 
                 items_added = await self._add_collection_items(new_luid, items)
                 perms_cloned = await self._clone_collection_permissions(old_luid, new_luid, old_user_id, new_user_id)
+
+                # C1 fix: Only delete old collection after confirming all items copied
+                if len(items) > 0 and items_added < len(items):
+                    logger.warning(
+                        f"Collection '{coll_name}': only {items_added}/{len(items)} items copied. "
+                        f"Skipping delete of old collection {old_luid} to prevent data loss."
+                    )
+                    self._audit.log_failure(
+                        AuditAction.CLONE_COLLECTION,
+                        error_message=f"Incomplete copy: {items_added}/{len(items)} items. Old collection preserved.",
+                        old_username=old_username,
+                        new_username=new_username,
+                        object_type="collection",
+                        object_name=coll_name,
+                        object_id=old_luid,
+                    )
+                    continue
 
                 await self._delete_collection(old_luid)
 
@@ -220,6 +248,83 @@ class CollectionService:
 
         print_status("DONE", f"Cloned {cloned} collections for {new_username}")
         return cloned
+
+    async def transfer_collection_ownership(
+        self,
+        old_user_id: str,
+        old_username: str,
+        new_user_id: str,
+        new_username: str,
+    ) -> int:
+        print_status("START", f"Transferring collection ownership: {old_username} -> {new_username}")
+        collections = self.get_user_collections(old_user_id, old_username)
+        if not collections:
+            print_status("DONE", f"No collections to transfer for {old_username}")
+            return 0
+
+        batch_endpoint = "/-/collections/batchUpdate"
+        items_xml = "".join(
+            f'<batchUpdateCollection luid="{coll["id"]}" ownerLuid="{new_user_id}"/>'
+            for coll in collections
+        )
+        batch_payload = f'<batchUpdateCollections>{items_xml}</batchUpdateCollections>'
+
+        try:
+            await self._client._base.request(
+                "POST", batch_endpoint,
+                content=batch_payload,
+                headers={"Accept": "application/json", "Content-Type": "application/xml"},
+            )
+            for coll in collections:
+                self._cache.invalidate_owner("collections", coll["id"], new_user_id)
+                self._audit.log_success(
+                    AuditAction.CLONE_COLLECTION,
+                    old_username=old_username,
+                    new_username=new_username,
+                    object_type="collection",
+                    object_name=coll.get("name") or "Untitled",
+                    object_id=coll["id"],
+                    details={"ownership_transferred": True, "method": "batchUpdate"},
+                )
+            print_status("DONE", f"Batch transferred {len(collections)} collections to {new_username}")
+            return len(collections)
+        except Exception as e:
+            logger.warning(f"Batch XML collection ownership transfer failed: {e}")
+            transferred = 0
+            for coll in collections:
+                coll_luid = coll["id"]
+                coll_name = coll.get("name") or "Untitled"
+                try:
+                    single_payload = f'<batchUpdateCollections><batchUpdateCollection luid="{coll_luid}" ownerLuid="{new_user_id}"/></batchUpdateCollections>'
+                    await self._client._base.request(
+                        "POST", batch_endpoint,
+                        content=single_payload,
+                        headers={"Accept": "application/json", "Content-Type": "application/xml"},
+                    )
+                    transferred += 1
+                    self._cache.invalidate_owner("collections", coll_luid, new_user_id)
+                    self._audit.log_success(
+                        AuditAction.CLONE_COLLECTION,
+                        old_username=old_username,
+                        new_username=new_username,
+                        object_type="collection",
+                        object_name=coll_name,
+                        object_id=coll_luid,
+                        details={"ownership_transferred": True},
+                    )
+                except Exception as inner_e:
+                    logger.warning(f"Failed to transfer collection '{coll_name}': {inner_e}")
+                    self._audit.log_failure(
+                        AuditAction.CLONE_COLLECTION,
+                        error_message=str(inner_e),
+                        old_username=old_username,
+                        new_username=new_username,
+                        object_type="collection",
+                        object_name=coll_name,
+                        object_id=coll_luid,
+                    )
+            print_status("DONE", f"Transferred {transferred} collections to {new_username}")
+            return transferred
 
     async def remove_collections(self, user_id: str, username: str) -> int:
         print_status("START", f"Removing collections from {username}")

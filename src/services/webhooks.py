@@ -1,7 +1,11 @@
+# Tableau webhook ownership transfer service using JSON API
+# Co-authored with CoCo
 from typing import List, Dict
+import json
 
 from src.api.client import TableauAPIClient
 from src.utils.cache import DimensionCache, owner_filter
+from src.utils.paths import resolve_endpoint_path
 from reporting.audit import AuditLogger, AuditAction
 from src.utils.logging_config import get_logger, print_status
 
@@ -9,10 +13,17 @@ logger = get_logger(__name__)
 
 
 class WebhookService:
-    def __init__(self, client: TableauAPIClient, audit: AuditLogger, cache: DimensionCache):
+    def __init__(self, client: TableauAPIClient, audit: AuditLogger, cache: DimensionCache, endpoints_config: dict):
         self._client = client
         self._audit = audit
         self._cache = cache
+        self._endpoints = endpoints_config.get("endpoints", {})
+
+    def _resolve_path(self, endpoint_name: str, **kwargs) -> str:
+        ep_config = self._endpoints.get(endpoint_name)
+        if not ep_config:
+            raise ValueError(f"Unknown endpoint: {endpoint_name}")
+        return resolve_endpoint_path(ep_config["path"], self._client.site_id, **kwargs)
 
     def get_user_webhooks(self, user_id: str, username: str) -> List[Dict]:
         webhook_ids = self._cache.get_ids("webhooks", filter_fn=owner_filter(user_id))
@@ -40,14 +51,22 @@ class WebhookService:
         cloned = 0
 
         for wh in webhooks:
-            endpoint = f"/sites/{self._client.site_id}/webhooks/{wh['webhook_id']}"
-            payload = (
-                f'<tsRequest><webhook>'
-                f'<owner id="{new_user_id}"/>'
-                f'</webhook></tsRequest>'
-            )
+            endpoint = self._resolve_path("webhook_single", webhook_id=wh['webhook_id'])
+            # H1 fix: Webhook API requires JSON payload, not XML
+            payload = json.dumps({
+                "webhook": {
+                    "owner": {"id": new_user_id},
+                    "webhook-destination": {
+                        "webhook-destination-http": {"url": wh["url"]}
+                    },
+                }
+            })
             try:
-                await self._client.put(endpoint, payload)
+                await self._client._base.request(
+                    "PUT", endpoint,
+                    content=payload,
+                    headers={"Accept": "application/json", "Content-Type": "application/json"},
+                )
                 cloned += 1
                 self._audit.log_success(
                     AuditAction.CLONE_WEBHOOK,
@@ -76,7 +95,7 @@ class WebhookService:
         removed = 0
 
         for wh in webhooks:
-            endpoint = f"/sites/{self._client.site_id}/webhooks/{wh['webhook_id']}"
+            endpoint = self._resolve_path("webhook_single", webhook_id=wh['webhook_id'])
             try:
                 await self._client.delete(endpoint)
                 removed += 1

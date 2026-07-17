@@ -1,7 +1,11 @@
+# Tableau user CRUD and deactivation service
+# Co-authored with CoCo
 from typing import Optional, Dict
 
 from src.api.client import TableauAPIClient, _findall_any, _find_any, _strip_ns
 from src.utils.cache import DimensionCache
+from src.utils.exceptions import TableauMigrateError
+from src.utils.paths import resolve_endpoint_path
 from reporting.audit import AuditLogger, AuditAction
 from src.utils.logging_config import get_logger, print_status
 
@@ -9,10 +13,17 @@ logger = get_logger(__name__)
 
 
 class UserService:
-    def __init__(self, client: TableauAPIClient, audit: AuditLogger, cache: Optional[DimensionCache] = None):
+    def __init__(self, client: TableauAPIClient, audit: AuditLogger, cache: Optional[DimensionCache] = None, endpoints_config: Optional[dict] = None):
         self._client = client
         self._audit = audit
         self._cache = cache
+        self._endpoints = (endpoints_config or {}).get("endpoints", {})
+
+    def _resolve_path(self, endpoint_name: str, **kwargs) -> str:
+        ep_config = self._endpoints.get(endpoint_name)
+        if not ep_config:
+            raise ValueError(f"Unknown endpoint: {endpoint_name}")
+        return resolve_endpoint_path(ep_config["path"], self._client.site_id, **kwargs)
 
     async def lookup_user(self, username: str, live: bool = False) -> Optional[Dict]:
         normalized = username.lower()
@@ -27,7 +38,7 @@ class UserService:
                         "auth_setting": r.attrs.get("authSetting"),
                     }
 
-        endpoint = f"/sites/{self._client.site_id}/users?filter=name:eq:{username}"
+        endpoint = self._resolve_path("users") + f"?filter=name:eq:{username}"
         root = await self._client.get(endpoint)
         users = _findall_any(root, "user")
 
@@ -43,7 +54,7 @@ class UserService:
         }
 
     async def create_user(self, username: str, site_role: str, auth_setting: Optional[str] = None) -> Dict:
-        endpoint = f"/sites/{self._client.site_id}/users"
+        endpoint = self._resolve_path("users")
         auth_attr = f' authSetting="{auth_setting}"' if auth_setting else ""
         payload = (
             '<tsRequest>'
@@ -76,16 +87,28 @@ class UserService:
                         or (auth_setting and existing.get("auth_setting") != auth_setting)
                     )
                     if needs_update:
-                        await self.update_user(existing["id"], username, site_role, auth_setting)
-                        existing["site_role"] = site_role
-                        if auth_setting:
-                            existing["auth_setting"] = auth_setting
-                        self._audit.log_success(
-                            AuditAction.USER_REUSE,
-                            new_username=username,
-                            details={"updated_role": site_role, "updated_auth": auth_setting},
-                        )
-                        print_status("PUT", f"Updated existing user: {username} (siteRole={site_role}, authSetting={auth_setting})")
+                        try:
+                            await self.update_user(existing["id"], username, site_role, auth_setting)
+                            existing["site_role"] = site_role
+                            if auth_setting:
+                                existing["auth_setting"] = auth_setting
+                            self._audit.log_success(
+                                AuditAction.USER_REUSE,
+                                new_username=username,
+                                details={"updated_role": site_role, "updated_auth": auth_setting},
+                            )
+                            print_status("PUT", f"Updated existing user: {username} (siteRole={site_role}, authSetting={auth_setting})")
+                        except Exception as update_err:
+                            if existing["site_role"] == "Unlicensed":
+                                raise TableauMigrateError(
+                                    f"Target user '{username}' exists but is Unlicensed and cannot be re-licensed via API "
+                                    f"(likely a linked/SAML user). Re-license manually in Tableau Cloud before retrying. "
+                                    f"API error: {update_err}"
+                                ) from update_err
+                            raise TableauMigrateError(
+                                f"Target user '{username}' exists (role={existing['site_role']}) but site role update "
+                                f"to '{site_role}' failed: {update_err}"
+                            ) from update_err
                     else:
                         self._audit.log_success(
                             AuditAction.USER_REUSE,
@@ -97,7 +120,7 @@ class UserService:
             raise
 
     async def update_user(self, user_id: str, username: str, site_role: str, auth_setting: Optional[str] = None) -> None:
-        endpoint = f"/sites/{self._client.site_id}/users/{user_id}"
+        endpoint = self._resolve_path("user_single", user_id=user_id)
         auth_attr = f' authSetting="{auth_setting}"' if auth_setting else ""
         payload = f'<tsRequest><user siteRole="{site_role}"{auth_attr}/></tsRequest>'
         await self._client.put(endpoint, payload)

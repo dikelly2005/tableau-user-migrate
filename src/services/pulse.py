@@ -1,8 +1,11 @@
+# Tableau Pulse subscription and alert migration service
+# Co-authored with CoCo
 import json
 from typing import List, Dict, Optional
 
 from src.api.client import TableauAPIClient
 from src.utils.cache import DimensionCache
+from src.utils.paths import resolve_endpoint_path
 from reporting.audit import AuditLogger, AuditAction
 from src.utils.logging_config import get_logger, print_status
 
@@ -12,10 +15,17 @@ _JSON_HEADERS = {"Accept": "application/json", "Content-Type": "application/json
 
 
 class PulseService:
-    def __init__(self, client: TableauAPIClient, audit: AuditLogger, cache: DimensionCache):
+    def __init__(self, client: TableauAPIClient, audit: AuditLogger, cache: DimensionCache, endpoints_config: dict):
         self._client = client
         self._audit = audit
         self._cache = cache
+        self._endpoints = endpoints_config.get("endpoints", {})
+
+    def _resolve_path(self, endpoint_name: str, **kwargs) -> str:
+        ep_config = self._endpoints.get(endpoint_name)
+        if not ep_config:
+            raise ValueError(f"Unknown endpoint: {endpoint_name}")
+        return resolve_endpoint_path(ep_config["path"], self._client.site_id, **kwargs)
 
     def _get_subscriptions_from_cache(self, user_id: str) -> List[Dict]:
         records = self._cache.get_all_records("pulse_subscriptions")
@@ -66,13 +76,13 @@ class PulseService:
 
             payload = {
                 "metric_id": metric_id,
-                "user_id": new_user_id,
+                "follower_id": new_user_id,
             }
             condition = sub.get("condition")
             if condition:
                 payload["condition"] = condition
 
-            endpoint = "/-/api/pulse/subscriptions"
+            endpoint = self._resolve_path("pulse_subscriptions")
             try:
                 await self._client._base.request(
                     "POST", endpoint,
@@ -118,7 +128,7 @@ class PulseService:
             sub_id = sub.get("id")
             if not sub_id:
                 continue
-            endpoint = f"/-/api/pulse/subscriptions/{sub_id}"
+            endpoint = f"{self._resolve_path('pulse_subscriptions')}/{sub_id}"
             try:
                 await self._client._base.request(
                     "DELETE", endpoint, headers=_JSON_HEADERS,
@@ -170,74 +180,40 @@ class PulseService:
         new_user_id: str,
         new_username: str,
     ) -> int:
-        print_status("START", f"Cloning Pulse alerts: {old_username} -> {new_username}")
+        # Tableau Pulse API only exposes GET /pulse/alerts (read-only).
+        # PUT/PATCH on individual alerts is not supported — alerts cannot be transferred via API.
         alerts = self._get_alerts_from_cache(old_user_id)
-        cloned = 0
-
-        for alert in alerts:
-            alert_id = alert.get("id")
-            if not alert_id:
-                continue
-
-            endpoint = f"/-/pulse/alerts/{alert_id}"
-            payload = {"owner_id": new_user_id}
-            try:
-                await self._client._base.request(
-                    "PUT", endpoint,
-                    content=json.dumps(payload),
-                    headers=_JSON_HEADERS,
-                )
-                cloned += 1
-                self._audit.log_success(
+        if alerts:
+            logger.warning(
+                f"Cannot clone {len(alerts)} Pulse alerts for {old_username}: "
+                "Tableau API does not support PUT/DELETE on alerts"
+            )
+            for alert in alerts:
+                self._audit.log_skipped(
                     AuditAction.CLONE_PULSE_ALERT,
+                    reason="Tableau Pulse API does not support alert transfer (GET-only endpoint)",
                     old_username=old_username,
                     new_username=new_username,
-                    object_type="pulse_alert",
-                    object_id=alert_id,
-                    details={"metric_id": alert.get("metric_id")},
+                    object_id=alert.get("id"),
                 )
-            except Exception as e:
-                logger.warning(f"Failed to transfer Pulse alert {alert_id}: {e}")
-                self._audit.log_failure(
-                    AuditAction.CLONE_PULSE_ALERT,
-                    error_message=str(e),
-                    old_username=old_username,
-                    new_username=new_username,
-                    object_id=alert_id,
-                )
-
-        print_status("DONE", f"Transferred {cloned} Pulse alerts to {new_username}")
-        return cloned
+        print_status("SKIP", f"Pulse alerts cannot be transferred via API ({len(alerts)} found for {old_username})")
+        return 0
 
     async def remove_pulse_alerts(self, user_id: str, username: str) -> int:
-        print_status("START", f"Removing Pulse alerts from {username}")
+        # Tableau Pulse API only exposes GET /pulse/alerts (read-only).
+        # DELETE on individual alerts is not supported.
         alerts = self._get_alerts_from_cache(user_id)
-        removed = 0
-
-        for alert in alerts:
-            alert_id = alert.get("id")
-            if not alert_id:
-                continue
-            endpoint = f"/-/pulse/alerts/{alert_id}"
-            try:
-                await self._client._base.request(
-                    "DELETE", endpoint, headers=_JSON_HEADERS,
-                )
-                removed += 1
-                self._audit.log_success(
+        if alerts:
+            logger.warning(
+                f"Cannot remove {len(alerts)} Pulse alerts for {username}: "
+                "Tableau API does not support DELETE on alerts"
+            )
+            for alert in alerts:
+                self._audit.log_skipped(
                     AuditAction.REMOVE_PULSE_ALERT,
+                    reason="Tableau Pulse API does not support alert deletion (GET-only endpoint)",
                     old_username=username,
-                    object_type="pulse_alert",
-                    object_id=alert_id,
+                    object_id=alert.get("id"),
                 )
-            except Exception as e:
-                logger.warning(f"Failed to remove Pulse alert {alert_id}: {e}")
-                self._audit.log_failure(
-                    AuditAction.REMOVE_PULSE_ALERT,
-                    error_message=str(e),
-                    old_username=username,
-                    object_id=alert_id,
-                )
-
-        print_status("DONE", f"Removed {removed} Pulse alerts from {username}")
-        return removed
+        print_status("SKIP", f"Pulse alerts cannot be removed via API ({len(alerts)} found for {username})")
+        return 0

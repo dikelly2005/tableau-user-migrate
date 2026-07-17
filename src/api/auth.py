@@ -1,11 +1,15 @@
+# Tableau Cloud authentication with externalized scopes and phase-boundary refresh
+# Co-authored with CoCo
 import asyncio
 import time
 import uuid
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from pathlib import Path
+from typing import Optional, List
 
 import httpx
 import jwt
+import yaml
 
 from config.settings import Settings, AuthConfig, ApiConfig
 from src.utils.exceptions import AuthenticationError
@@ -14,14 +18,24 @@ from src.utils.logging_config import get_logger, print_status
 logger = get_logger(__name__)
 
 _JWT_EXPIRY_MINUTES = 5
-_SESSION_DURATION_SECONDS = 2 * 60 * 60
+_DEFAULT_SESSION_DURATION_SECONDS = 2 * 60 * 60
 _IDLE_TIMEOUT_SECONDS = 30 * 60
 
 
+def load_scopes(scopes_path: Optional[Path] = None) -> List[str]:
+    if scopes_path is None:
+        scopes_path = Path(__file__).resolve().parent.parent.parent / "config" / "scopes.yaml"
+    with open(scopes_path, "r") as f:
+        data = yaml.safe_load(f)
+    return data.get("scopes", [])
+
+
 class TableauAuthenticator:
-    def __init__(self, auth_config: AuthConfig, api_config: ApiConfig):
+    def __init__(self, auth_config: AuthConfig, api_config: ApiConfig, scopes: Optional[List[str]] = None):
         self._auth_config = auth_config
         self._api_config = api_config
+        self._scopes = scopes or load_scopes()
+        self._session_duration_seconds = getattr(api_config, 'session_duration_seconds', _DEFAULT_SESSION_DURATION_SECONDS)
         self._rest_api_token: Optional[str] = None
         self._rest_api_token_expiry: Optional[datetime] = None
         self._site_id: Optional[str] = None
@@ -63,12 +77,7 @@ class TableauAuthenticator:
             "jti": str(uuid.uuid4()),
             "aud": "tableau",
             "sub": self._auth_config.jwt_username,
-            "scp": ["tableau:content:read", "tableau:users:read",
-                     "tableau:users:create", "tableau:permissions:read",
-                     "tableau:permissions:update", "tableau:groups:read",
-                     "tableau:groups:update", "tableau:workbooks:read",
-                     "tableau:datasources:read", "tableau:flows:read",
-                     "tableau:tasks:read", "tableau:views:read"],
+            "scp": self._scopes,
         }
         headers = {
             "kid": self._auth_config.jwt_secret_id,
@@ -103,7 +112,7 @@ class TableauAuthenticator:
 
         self._parse_auth_response(response.text)
         self._auth_method = "jwt"
-        self._rest_api_token_expiry = datetime.now(timezone.utc) + timedelta(seconds=_SESSION_DURATION_SECONDS)
+        self._rest_api_token_expiry = datetime.now(timezone.utc) + timedelta(seconds=self._session_duration_seconds)
         print_status("AUTH", f"JWT authenticated as {self._auth_config.jwt_username} (site_id={self._site_id})")
 
     async def authenticate_pat(self, client: httpx.AsyncClient) -> None:
@@ -131,7 +140,7 @@ class TableauAuthenticator:
 
         self._parse_auth_response(response.text)
         self._auth_method = "pat"
-        self._rest_api_token_expiry = datetime.now(timezone.utc) + timedelta(seconds=_SESSION_DURATION_SECONDS)
+        self._rest_api_token_expiry = datetime.now(timezone.utc) + timedelta(seconds=self._session_duration_seconds)
         print_status("AUTH", f"PAT authenticated (site_id={self._site_id})")
 
     def _parse_auth_response(self, xml_text: str) -> None:
@@ -195,6 +204,14 @@ class TableauAuthenticator:
         print_status("AUTH", "Token expired or near expiry, re-authenticating")
         await self.authenticate(client)
 
+    async def ensure_token_for_phase(self, client: httpx.AsyncClient, phase_name: str) -> None:
+        if self._is_token_expired():
+            print_status("AUTH", f"Refreshing token before phase: {phase_name}")
+            await self.authenticate(client)
+        else:
+            remaining = (self._rest_api_token_expiry - datetime.now(timezone.utc)).total_seconds()
+            logger.debug(f"Token valid for {remaining:.0f}s — proceeding with phase: {phase_name}")
+
     def get_auth_headers(self) -> dict[str, str]:
         if not self._rest_api_token:
             raise AuthenticationError("Not authenticated")
@@ -208,7 +225,4 @@ class TableauAuthenticator:
             await client.post(url, headers=self.get_auth_headers())
         except Exception:
             pass
-        self._rest_api_token = None
-        self._site_id = None
-        self._user_id = None
-        print_status("AUTH", "Signed out")
+        self._rest_api_token

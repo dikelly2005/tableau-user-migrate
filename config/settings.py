@@ -1,4 +1,7 @@
+# Tableau user migration configuration with env-based settings
+# Co-authored with CoCo
 import os
+import warnings
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
@@ -77,6 +80,7 @@ class ApiConfig:
     rate_limit_rps: int = 10
     connect_timeout: float = 60.0
     read_timeout: float = 300.0
+    session_duration_seconds: int = 7200
 
 
 @dataclass
@@ -105,6 +109,7 @@ class Settings:
     cache: CacheConfig = field(default_factory=CacheConfig)
     paths: PathConfig = field(default_factory=PathConfig)
     mode: str = "dry-run"
+    migration_artifacts_project: str = "User Migration Artifacts"
 
     VALID_MODES: tuple = field(
         default=("dry-run", "clone", "migrate", "clean-only"),
@@ -157,6 +162,7 @@ class Settings:
             rate_limit_rps=_env_int("RATE_LIMIT_RPS", 10),
             connect_timeout=_env_float("CONNECT_TIMEOUT", 60.0),
             read_timeout=_env_float("READ_TIMEOUT", 300.0),
+            session_duration_seconds=_env_int("SESSION_DURATION_SECONDS", 7200),
         )
 
         log_location = _resolve_path(log_raw)
@@ -171,7 +177,8 @@ class Settings:
             log_location=log_location,
         )
 
-        return cls(auth=auth, api=api, cache=cache_config, paths=paths)
+        return cls(auth=auth, api=api, cache=cache_config, paths=paths,
+                   migration_artifacts_project=os.environ.get("MIGRATION_ARTIFACTS_PROJECT", "User Migration Artifacts"))
 
     def validate(self) -> None:
         if not self.auth.has_jwt and not self.auth.has_pat:
@@ -184,6 +191,12 @@ class Settings:
         if parsed.scheme not in ("https", "http"):
             raise ConfigurationError(
                 f"SERVER_URL must begin with https:// or http://, got: {self.api.server_url!r}"
+            )
+        if parsed.scheme == "http":
+            warnings.warn(
+                f"SERVER_URL uses http:// — credentials will be sent unencrypted. "
+                f"Use https:// for production environments: {self.api.server_url}",
+                stacklevel=2,
             )
         if not parsed.netloc:
             raise ConfigurationError(

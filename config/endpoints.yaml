@@ -6,6 +6,7 @@
 #
 # Source: https://help.tableau.com/current/api/rest_api/en-us/REST/rest_api_ref.htm
 # API Version: 3.21+
+# Scopes validated against: output/tableau_endpoints.json (discover_tableau_endpoints.py)
 #
 # Schema:
 #   path:            URL pattern ({site_id}, {workbook_id}, etc. replaced at runtime)
@@ -18,11 +19,14 @@
 #   ownership_transferable: true if ownership can be changed via PUT
 #   primary_key:     ID field name if not "id" (e.g., "luid", "clientId")
 #   single_object:   true if endpoint returns one object (not paginated)
+#   auth_type:       jwt (default) or pat — which auth session to use
+#   scope:           JWT scope required (from tableau_endpoints.json)
 #
 # Consumers:
 #   src/utils/cache.py          — warmup fetches entries where cache: true
 #   src/services/permissions.py — iterates entries with permissions_endpoint
 #   src/services/ownership.py   — iterates entries with ownership_transferable: true
+#   src/api/base.py             — routes pat auth_type to PAT session
 #   src/services/*.py           — child lookups resolved via cache parent_id/owner_id
 # =============================================================================
 
@@ -36,16 +40,44 @@ endpoints:
     path: "sites/{site_id}/users"
     response_key: users.user
     cache: true
+    scope: tableau:users:read
+    scope_write: tableau:users:create
+
+    scope_write: tableau:users:create
+  user_single:
+    path: "sites/{site_id}/users/{user_id}"
+    single_object: true
+    scope: tableau:users:read
+    scope_write: tableau:users:update
+
+    scope_write: tableau:users:update
+  user_groups:
+    path: "sites/{site_id}/users/{user_id}/groups"
+    response_key: groups.group
+    parent: users
+    scope: tableau:users:read
 
   groups:
     path: "sites/{site_id}/groups"
     response_key: groups.group
     cache: true
+    scope: tableau:groups:read
+    scope_write: tableau:groups:create
 
+    scope_write: tableau:groups:create
   group_users:
     path: "sites/{site_id}/groups/{group_id}/users"
     response_key: users.user
     parent: groups
+    scope: tableau:groups:read
+    scope_write: tableau:groups:update
+
+    scope_write: tableau:groups:update
+  group_user_single:
+    path: "sites/{site_id}/groups/{group_id}/users/{user_id}"
+    single_object: true
+    parent: groups
+    scope: tableau:groups:update
 
   # ===========================================================================
   # PROJECTS
@@ -57,6 +89,8 @@ endpoints:
     cache: true
     permissions_endpoint: "sites/{site_id}/projects/{id}/permissions"
     ownership_transferable: true
+    scope: tableau:content:read
+    scope_write: tableau:projects:create
 
   # ===========================================================================
   # WORKBOOKS AND VIEWS
@@ -68,22 +102,42 @@ endpoints:
     cache: true
     permissions_endpoint: "sites/{site_id}/workbooks/{id}/permissions"
     ownership_transferable: true
+    scope: tableau:content:read
+    scope_write: tableau:workbooks:create
 
+    scope_write: tableau:workbooks:create
   views:
     path: "sites/{site_id}/views"
     response_key: views.view
     cache: true
     permissions_endpoint: "sites/{site_id}/views/{id}/permissions"
+    scope: tableau:content:read
 
   custom_views:
     path: "sites/{site_id}/customviews"
     response_key: customViews.customView
     cache: true
+    scope: tableau:content:read
+
+    scope: tableau:content:read
+  custom_view_single:
+    path: "sites/{site_id}/customviews/{custom_view_id}"
+    single_object: true
+    scope: tableau:sites:read
+    scope_write: tableau:sites:create
 
   custom_view_default_users:
-    path: "sites/{site_id}/customviews/{custom_view_luid}/default/users"
+    path: "sites/{site_id}/customviews/{custom_view_id}/default/users"
     response_key: users.user
     parent: custom_views
+    scope: tableau:sites:read
+    scope_write: tableau:sites:create
+
+  custom_view_default_user_single:
+    path: "sites/{site_id}/customviews/{custom_view_id}/default/users/{user_id}"
+    single_object: true
+    scope: tableau:sites:read
+    scope_write: tableau:sites:create
 
   # ===========================================================================
   # DATA SOURCES
@@ -95,6 +149,8 @@ endpoints:
     cache: true
     permissions_endpoint: "sites/{site_id}/datasources/{id}/permissions"
     ownership_transferable: true
+    scope: tableau:content:read
+    scope_write: tableau:datasources:create
 
   # ===========================================================================
   # FLOWS
@@ -106,6 +162,8 @@ endpoints:
     cache: true
     permissions_endpoint: "sites/{site_id}/flows/{id}/permissions"
     ownership_transferable: true
+    scope: tableau:flows:read
+    scope_write: tableau:flows:create
 
   # ===========================================================================
   # VIRTUAL CONNECTIONS
@@ -119,6 +177,8 @@ endpoints:
     ownership_transferable: true
     params:
       fields: _all_
+    scope: tableau:content:read
+    scope_write: tableau:virtual_connections:create
 
   # ===========================================================================
   # METADATA (external assets with permissions)
@@ -148,6 +208,29 @@ endpoints:
     format: json
     primary_key: luid
     cache: true
+    scope: tableau:collections:read
+    scope_write: tableau:collections:create
+
+    scope: tableau:collections:read
+    scope_write: tableau:collections:create
+  collection_single:
+    path: "-/collections/{collection_luid}"
+    format: json
+    single_object: true
+    scope: tableau:collections:read
+    scope_write: tableau:collections:create
+
+  batch_update_collections:
+    path: "-/collections/batchUpdate"
+    method: POST
+    format: json
+    scope: tableau:collections:update
+
+  collection_items:
+    path: "-/collections/{collection_luid}/items"
+    format: json
+    scope: tableau:collections:read
+    scope_write: tableau:collections:create
 
   # ===========================================================================
   # SUBSCRIPTIONS
@@ -157,6 +240,15 @@ endpoints:
     path: "sites/{site_id}/subscriptions"
     response_key: subscriptions.subscription
     cache: true
+    scope: tableau:tasks:read
+    scope_write: tableau:tasks:create
+
+    scope: tableau:tasks:read
+    scope_write: tableau:tasks:create
+  subscription_single:
+    path: "sites/{site_id}/subscriptions/{subscription_id}"
+    single_object: true
+    scope: tableau:tasks:read
 
   # ===========================================================================
   # NOTIFICATIONS / ALERTS
@@ -166,6 +258,28 @@ endpoints:
     path: "sites/{site_id}/dataAlerts"
     response_key: dataAlerts.dataAlert
     cache: true
+    scope: tableau:data_driven_alerts:read
+    scope_write: tableau:data_driven_alerts:create
+
+    scope: tableau:data_driven_alerts:read
+    scope_write: tableau:data_driven_alerts:create
+  data_alert_single:
+    path: "sites/{site_id}/dataAlerts/{alert_id}"
+    single_object: true
+    scope: tableau:data_driven_alerts:read
+    scope_write: tableau:data_driven_alerts:create
+
+  data_alert_users:
+    path: "sites/{site_id}/dataAlerts/{alert_id}/users"
+    response_key: users.user
+    scope: tableau:data_driven_alerts:read
+    scope_write: tableau:data_driven_alerts:create
+
+  data_alert_user_single:
+    path: "sites/{site_id}/dataAlerts/{alert_id}/users/{user_id}"
+    single_object: true
+    scope: tableau:data_driven_alerts:read
+    scope_write: tableau:data_driven_alerts:create
 
   # ===========================================================================
   # WEBHOOKS
@@ -176,6 +290,33 @@ endpoints:
     response_key: webhooks.webhook
     cache: true
     ownership_transferable: true
+    scope: tableau:sites:read
+    scope_write: tableau:sites:create
+
+  webhook_single:
+    path: "sites/{site_id}/webhooks/{webhook_id}"
+    single_object: true
+    scope: tableau:sites:read
+    scope_write: tableau:sites:create
+
+  # ===========================================================================
+  # FAVORITES
+  # ===========================================================================
+
+  user_favorites:
+    path: "sites/{site_id}/favorites/{user_id}"
+    response_key: favorites.favorite
+    parent: users
+    scope: tableau:content:read
+    scope_write: tableau:favorites:update
+
+    scope: tableau:content:read
+    scope_write: tableau:favorites:update
+  user_favorite_single:
+    path: "sites/{site_id}/favorites/{user_id}/{content_type}/{content_id}"
+    single_object: true
+    scope: tableau:content:read
+    scope_write: tableau:favorites:update
 
   # ===========================================================================
   # PULSE (JSON API — metric definitions and subscriptions)
@@ -187,20 +328,29 @@ endpoints:
     format: json
     cache: true
     pagination: cursor
+    scope: tableau:insight_definitions_metrics:read
+    scope_write: tableau:insight_definitions:create
 
+    scope: tableau:insight_definitions_metrics:read
+    scope_write: tableau:insight_definitions:create
   pulse_subscriptions:
     path: "-/pulse/subscriptions"
     response_key: subscriptions
     format: json
     cache: true
     pagination: cursor
+    scope: tableau:metric_subscriptions:read
+    scope_write: tableau:metric_subscriptions:create
 
+    scope: tableau:metric_subscriptions:read
+    scope_write: tableau:metric_subscriptions:create
   pulse_alerts:
     path: "-/pulse/alerts"
     response_key: alerts
     format: json
     cache: true
     pagination: cursor
+    scope: tableau:insights_alerts:read
 
   # ===========================================================================
   # SCHEDULED TASKS (read-only — for impact reporting)
@@ -217,15 +367,6 @@ endpoints:
   #   cache: true
 
   # ===========================================================================
-  # FAVORITES
-  # ===========================================================================
-
-  user_favorites:
-    path: "sites/{site_id}/favorites/{user_id}"
-    response_key: favorites.favorite
-    parent: users
-
-  # ===========================================================================
   # AUTHENTICATION (PATs per user)
   # ===========================================================================
 
@@ -233,6 +374,8 @@ endpoints:
     path: "sites/{site_id}/users/{user_id}/personal-access-tokens"
     response_key: personalAccessTokens.personalAccessToken
     parent: users
+    scope: tableau:sites:read
+    scope_write: tableau:sites:create
 
   # ===========================================================================
   # PERMISSIONS — child endpoints (require parent IDs)
@@ -242,46 +385,73 @@ endpoints:
     path: "sites/{site_id}/workbooks/{workbook_id}/permissions"
     response_key: permissions
     parent: workbooks
+    scope: tableau:permissions:read
+    scope_write: tableau:permissions:update
 
+    scope: tableau:permissions:read
+    scope_write: tableau:permissions:update
   view_permissions:
     path: "sites/{site_id}/views/{view_id}/permissions"
     response_key: permissions
     parent: views
+    scope: tableau:permissions:read
+    scope_write: tableau:permissions:update
 
+    scope: tableau:permissions:read
+    scope_write: tableau:permissions:update
   datasource_permissions:
     path: "sites/{site_id}/datasources/{datasource_id}/permissions"
     response_key: permissions
     parent: datasources
+    scope: tableau:permissions:read
+    scope_write: tableau:permissions:update
 
+    scope: tableau:permissions:read
+    scope_write: tableau:permissions:update
   flow_permissions:
     path: "sites/{site_id}/flows/{flow_id}/permissions"
     response_key: permissions
     parent: flows
+    scope: tableau:permissions:read
+    scope_write: tableau:permissions:update
 
+    scope: tableau:permissions:read
+    scope_write: tableau:permissions:update
   project_permissions:
     path: "sites/{site_id}/projects/{project_id}/permissions"
     response_key: permissions
     parent: projects
+    scope: tableau:permissions:read
+    scope_write: tableau:permissions:update
 
+    scope: tableau:permissions:read
+    scope_write: tableau:permissions:update
   virtual_connection_permissions:
     path: "sites/{site_id}/virtualconnections/{virtual_connection_luid}/permissions"
     response_key: permissions
     parent: virtual_connections
+    scope: tableau:sites:read
+    scope_write: tableau:sites:create
 
   database_permissions:
     path: "sites/{site_id}/databases/{database_luid}/permissions"
     response_key: permissions
     parent: databases
+    scope: tableau:sites:read
+    scope_write: tableau:sites:create
 
   table_permissions:
     path: "sites/{site_id}/tables/{table_id}/permissions"
     response_key: permissions
     parent: tables
+    scope: tableau:sites:read
+    scope_write: tableau:sites:create
 
   collection_permissions:
     path: "sites/{site_id}/collections/{collection_luid}/permissions"
     response_key: permissions
     parent: collections
+    scope: tableau:permissions:read
 
   # ===========================================================================
   # DEFAULT PERMISSIONS (per project, per content type)
@@ -291,41 +461,58 @@ endpoints:
     path: "sites/{site_id}/projects/{project_luid}/default-permissions/workbooks"
     response_key: permissions
     parent: projects
+    scope: tableau:permissions:read
+    scope_write: tableau:permissions:update
 
+    scope: tableau:permissions:read
+    scope_write: tableau:permissions:update
   project_default_permissions_datasources:
     path: "sites/{site_id}/projects/{project_luid}/default-permissions/datasources"
     response_key: permissions
     parent: projects
+    scope: tableau:content:read
+    scope_write: tableau:projects:create
 
   project_default_permissions_flows:
     path: "sites/{site_id}/projects/{project_luid}/default-permissions/flows"
     response_key: permissions
     parent: projects
+    scope: tableau:content:read
+    scope_write: tableau:projects:create
 
   project_default_permissions_virtualconnections:
     path: "sites/{site_id}/projects/{project_luid}/default-permissions/virtualconnections"
     response_key: permissions
     parent: projects
+    scope: tableau:content:read
+    scope_write: tableau:projects:create
 
   project_default_permissions_databases:
     path: "sites/{site_id}/projects/{project_luid}/default-permissions/databases"
     response_key: permissions
     parent: projects
+    scope: tableau:content:read
+    scope_write: tableau:projects:create
 
   project_default_permissions_tables:
     path: "sites/{site_id}/projects/{project_luid}/default-permissions/tables"
     response_key: permissions
     parent: projects
+    scope: tableau:content:read
+    scope_write: tableau:projects:create
 
   project_default_permissions_metrics:
     path: "sites/{site_id}/projects/{project_luid}/default-permissions/metrics"
     response_key: permissions
     parent: projects
+    scope: tableau:content:read
+    scope_write: tableau:projects:create
 
   database_default_permissions:
     path: "sites/{site_id}/databases/{database_luid}/default-permissions/tables"
     response_key: permissions
     parent: databases
+    auth_type: pat
 
 
 # =============================================================================

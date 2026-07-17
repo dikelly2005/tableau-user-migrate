@@ -99,11 +99,13 @@ Steps that will execute on resume:
   → clone_subscriptions
   → clone_alerts
   → clone_custom_views
-  → remove_permissions
-  → remove_groups
+  → clone_custom_view_defaults
+  → remove_custom_view_defaults
   → remove_favorites
   → remove_subscriptions
   → remove_alerts
+  → remove_permissions
+  → remove_groups
   → deactivate
 ```
 
@@ -111,7 +113,7 @@ Steps that will execute on resume:
 
 ## Workflow Step Reference
 
-### Migrate Workflow (16 steps per user)
+### Migrate Workflow (23 steps per user)
 
 | # | Step Name | Operation | Reversible? |
 |---|-----------|-----------|:-----------:|
@@ -123,16 +125,21 @@ Steps that will execute on resume:
 | 6 | `clone_subscriptions` | Create matching subscriptions for new user | Yes — delete subscriptions |
 | 7 | `clone_alerts` | Add new user to data alerts + transfer ownership | Yes — remove from alerts |
 | 8 | `clone_custom_views` | Transfer ownership + migrate default user status | Yes — transfer back |
-| 9 | `clone_collections` | Clone-and-replace (new collection + items + perms) | Old collection deleted |
-| 10 | `clone_pulse_subscriptions` | Clone Pulse subscriptions to new user | Yes — delete |
-| 11 | `clone_pulse_alerts` | Transfer Pulse alert ownership to new user | Yes — transfer back |
-| 12 | `clone_webhooks` | Transfer webhook ownership to new user | Yes — transfer back |
-| 13 | `remove_permissions` | Strip old user's explicit + default permissions | Requires re-grant |
-| 14 | `remove_groups` | Remove old user from groups | Requires re-add |
+| 9 | `clone_custom_view_defaults` | Set non-owned CV defaults on new user + remove from old | Yes — reverse via API |
+| 10 | `clone_collections` | Clone-and-replace (new collection + items + perms) | Old collection deleted |
+| 11 | `clone_pulse_subscriptions` | Clone Pulse subscriptions to new user | Yes — delete |
+| 12 | `clone_pulse_alerts` | Transfer Pulse alert ownership to new user | Yes — transfer back |
+| 13 | `clone_webhooks` | Transfer webhook ownership to new user | Yes — transfer back |
+| 14 | `remove_custom_view_defaults` | Remove old user's CV defaults | Requires re-set |
 | 15 | `remove_favorites` | Delete old user's favorites | Requires re-add |
 | 16 | `remove_subscriptions` | Delete old user's subscriptions | Requires re-create |
 | 17 | `remove_alerts` | Remove old user from alerts | Requires re-add |
-| 18 | `deactivate` | Set old user to Unlicensed | Re-license manually |
+| 18 | `remove_pulse_subscriptions` | Remove old user's Pulse subscriptions | Requires re-create |
+| 19 | `remove_pulse_alerts` | Remove old user's Pulse alerts | Requires re-create |
+| 20 | `remove_webhooks` | Remove old user's webhooks | Requires re-create |
+| 21 | `remove_permissions` | Strip old user's explicit + default permissions | Requires re-grant |
+| 22 | `remove_groups` | Remove old user from groups | Requires re-add |
+| 23 | `deactivate` | Set old user to Unlicensed | Re-license manually |
 
 ### Clone Workflow (11 steps per user)
 
@@ -150,20 +157,21 @@ Steps that will execute on resume:
 | 10 | `clone_pulse_alerts` | Transfer Pulse alert ownership |
 | 11 | `clone_webhooks` | Transfer webhook ownership |
 
-### Cleanup Workflow (10 steps per user)
+### Cleanup Workflow (11 steps per user)
 
 | # | Step Name | Operation |
 |---|-----------|-----------|
-| 1 | `remove_permissions` | Strip permissions |
-| 2 | `remove_groups` | Remove group memberships |
-| 3 | `remove_favorites` | Delete favorites |
-| 4 | `remove_subscriptions` | Delete subscriptions |
-| 5 | `remove_alerts` | Remove from alerts |
-| 6 | `remove_custom_views` | Delete custom views |
-| 7 | `remove_pulse_subscriptions` | Remove Pulse subscriptions |
-| 8 | `remove_pulse_alerts` | Remove Pulse alerts |
-| 9 | `remove_webhooks` | Remove webhooks |
-| 10 | `deactivate` | Unlicense user |
+| 1 | `remove_custom_view_defaults` | Remove CV default-user associations |
+| 2 | `remove_favorites` | Delete favorites |
+| 3 | `remove_subscriptions` | Delete subscriptions |
+| 4 | `remove_alerts` | Remove from alerts |
+| 5 | `remove_custom_views` | Delete custom views |
+| 6 | `remove_pulse_subscriptions` | Remove Pulse subscriptions |
+| 7 | `remove_pulse_alerts` | Remove Pulse alerts |
+| 8 | `remove_webhooks` | Remove webhooks |
+| 9 | `remove_permissions` | Strip permissions |
+| 10 | `remove_groups` | Remove group memberships |
+| 11 | `deactivate` | Unlicense user |
 
 ---
 
@@ -220,7 +228,7 @@ Only the failed user is retried. Everyone else stays completed.
 
 ### Scenario 4: Permissions cloned but old user NOT deactivated yet
 
-**Symptom**: Run interrupted after step 9 (`clone_collections`) but before step 13 (`remove_permissions`). Both users now have the same access.
+**Symptom**: Run interrupted after step 10 (`clone_collections`) but before step 14 (`remove_custom_view_defaults`). Both users now have the same access.
 
 **Impact**: Low risk — both users have access. No data loss. The old user simply hasn't been cleaned up yet.
 
@@ -229,7 +237,7 @@ Only the failed user is retried. Everyone else stays completed.
 python -m src.main --resume-latest
 ```
 
-Steps 1-9 are skipped (already completed). Execution resumes at step 13 (`remove_permissions`) and continues through deactivation.
+Steps 1-10 are skipped (already completed). Execution resumes at step 14 (`remove_custom_view_defaults`) and continues through deactivation.
 
 ### Scenario 11: Verifying migration outcomes with comparison
 

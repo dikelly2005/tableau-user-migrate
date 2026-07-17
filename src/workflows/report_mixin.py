@@ -1,3 +1,5 @@
+# Fix: pass cv_defaults to _build_user_report so custom view defaults appear in reports
+# Co-authored with CoCo
 import json
 from pathlib import Path
 from typing import List, Dict
@@ -176,6 +178,7 @@ class UserReportMixin:
         subs: List,
         alerts: List,
         cvs: List,
+        cv_defaults: List[Dict],
         collections: List[Dict],
         pulse_subs: List[Dict],
         pulse_alerts: List[Dict],
@@ -248,6 +251,18 @@ class UserReportMixin:
                 }
                 for cv in cvs
             ],
+            "custom_view_defaults": [
+                {
+                    "custom_view_id": d["custom_view_id"],
+                    "custom_view_name": d["custom_view_name"],
+                    "view_id": d["view_id"],
+                    "workbook_id": d["workbook_id"],
+                    "workbook_name": d["workbook_name"],
+                    "owner_id": d["owner_id"],
+                    "path": self._resolve_content_path("custom_views", d["custom_view_id"]),
+                }
+                for d in cv_defaults
+            ],
             "collections": [
                 {
                     "collection_id": c["id"],
@@ -291,6 +306,7 @@ class UserReportMixin:
                 "subscription_count": len(subs),
                 "alert_count": len(alerts),
                 "custom_view_count": len(cvs),
+                "custom_view_default_count": len(cv_defaults),
                 "collection_count": len(collections),
                 "pulse_subscription_count": len(pulse_subs),
                 "pulse_alert_count": len(pulse_alerts),
@@ -325,7 +341,7 @@ class UserReportMixin:
             validation_errors.append(f"Old user not found: {old_username}")
             report = self._build_user_report(
                 old_username, new_username, old_user, new_user,
-                [], [], [], [], [], [], [], [], [], [], [], [],
+                [], [], [], [], [], [], [], [], [], [], [], [], [],
                 validation_errors, validation_warnings,
             )
             report_path = user_reports_dir / f"{self._safe_filename(old_username)}.json"
@@ -358,6 +374,7 @@ class UserReportMixin:
         subs = await self._subscriptions.get_user_subscriptions(old_user_id, old_username)
         alerts = await self._alerts.get_user_alerts(old_user_id, old_username)
         cvs = await self._custom_views.get_user_custom_views(old_user_id, old_username)
+        cv_defaults = self._custom_views.get_user_custom_view_defaults(old_user_id, old_username)
         collections = self._collections.get_user_collections(old_user_id, old_username)
 
         pulse_subs = []
@@ -380,6 +397,11 @@ class UserReportMixin:
         if cvs:
             validation_warnings.append(
                 f"{len(cvs)} custom views will have ownership transferred to new user"
+            )
+
+        if cv_defaults:
+            validation_warnings.append(
+                f"{len(cv_defaults)} non-owned custom views are set as defaults for this user — defaults will be migrated to new user"
             )
 
         if collections:
@@ -426,7 +448,7 @@ class UserReportMixin:
         report = self._build_user_report(
             old_username, new_username, old_user, new_user,
             explicit_perms, default_perms, groups, owned,
-            favorites, subs, alerts, cvs, collections, pulse_subs, pulse_alerts, webhooks,
+            favorites, subs, alerts, cvs, cv_defaults, collections, pulse_subs, pulse_alerts, webhooks,
             validation_errors, validation_warnings,
         )
         report_path = user_reports_dir / f"{self._safe_filename(old_username)}.json"
@@ -447,6 +469,7 @@ class UserReportMixin:
             "subscription_count": len(subs),
             "alert_count": len(alerts),
             "custom_view_count": len(cvs),
+            "custom_view_default_count": len(cv_defaults),
             "collection_count": len(collections),
             "pulse_subscription_count": len(pulse_subs),
             "pulse_alert_count": len(pulse_alerts),

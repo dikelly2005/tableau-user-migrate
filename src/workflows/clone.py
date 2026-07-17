@@ -105,12 +105,16 @@ class CloneWorkflow(UserReportMixin):
                     self._checkpoint.mark_step_completed(old_username, "clone_subscriptions")
 
                 if not self._checkpoint.is_step_completed(old_username, "clone_alerts"):
-                    await self._alerts.clone_alerts(old_user_id, old_username, new_user_id, new_username)
+                    await self._alerts.clone_alerts(old_user_id, old_username, new_user_id, new_username, transfer_ownership=False)
                     self._checkpoint.mark_step_completed(old_username, "clone_alerts")
 
                 if not self._checkpoint.is_step_completed(old_username, "clone_custom_views"):
-                    await self._custom_views.clone_custom_views(old_user_id, old_username, new_user_id, new_username)
+                    print_status("SKIP", f"Custom view ownership skipped in clone mode (no copy API — use migrate mode to transfer): {old_username}")
                     self._checkpoint.mark_step_completed(old_username, "clone_custom_views")
+
+                if not self._checkpoint.is_step_completed(old_username, "clone_custom_view_defaults"):
+                    await self._custom_views.clone_custom_view_defaults(old_user_id, old_username, new_user_id, new_username)
+                    self._checkpoint.mark_step_completed(old_username, "clone_custom_view_defaults")
 
                 if not self._checkpoint.is_step_completed(old_username, "clone_collections"):
                     await self._collections.clone_collections(old_user_id, old_username, new_user_id, new_username)

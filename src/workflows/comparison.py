@@ -12,6 +12,7 @@ _COMPARE_FIELDS = [
     "subscription_count",
     "alert_count",
     "custom_view_count",
+    "custom_view_default_count",
     "collection_count",
     "pulse_subscription_count",
     "pulse_alert_count",

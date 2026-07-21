@@ -115,7 +115,7 @@ class ConfirmationManager:
             "  - Old users will be UNLICENSED and DEACTIVATED\n\n"
             "This is a complete end-to-end migration."
         )
-        return self.confirm_once(message)
+        return self.confirm_twice(message)
 
     def confirm_cleanup(self, num_users: int) -> bool:
         message = (

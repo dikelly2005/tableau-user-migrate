@@ -1,6 +1,8 @@
 # Per-user per-step checkpoint manager for resumable migrations
 # Co-authored with CoCo
 import json
+import os
+import tempfile
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +31,7 @@ class UserCheckpoint:
     updated_at: Optional[str] = None
     error: Optional[str] = None
     steps_completed: List[str] = field(default_factory=list)
+    retry_count: int = 0
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -48,7 +51,6 @@ class CheckpointManager:
         self._file_path: Optional[Path] = None
         self._run_id: Optional[str] = None
         self._mode: Optional[str] = None
-        self._dirty = False
 
     @property
     def total(self) -> int:
@@ -86,7 +88,6 @@ class CheckpointManager:
         cp.status = CheckpointStatus.IN_PROGRESS
         cp.started_at = datetime.now(timezone.utc).isoformat()
         cp.updated_at = cp.started_at
-        self._dirty = False
         self.save()
 
     def mark_completed(self, old_username: str) -> None:
@@ -96,7 +97,6 @@ class CheckpointManager:
         cp.status = CheckpointStatus.COMPLETED
         cp.updated_at = datetime.now(timezone.utc).isoformat()
         cp.error = None
-        self._dirty = False
         self.save()
         print_status("CHECKPOINT", f"Completed: {old_username}")
 
@@ -107,9 +107,9 @@ class CheckpointManager:
         cp.status = CheckpointStatus.FAILED
         cp.updated_at = datetime.now(timezone.utc).isoformat()
         cp.error = error
-        self._dirty = False
+        cp.retry_count += 1
         self.save()
-        print_status("CHECKPOINT", f"Failed: {old_username} — {error[:100]}")
+        print_status("CHECKPOINT", f"Failed: {old_username} — {error[:100]} (attempt {cp.retry_count})")
 
     def is_failed(self, old_username: str) -> bool:
         cp = self._checkpoints.get(old_username)
@@ -124,12 +124,10 @@ class CheckpointManager:
         if step not in cp.steps_completed:
             cp.steps_completed.append(step)
         cp.updated_at = datetime.now(timezone.utc).isoformat()
-        self._dirty = True
+        self.save()
 
     def flush(self) -> None:
-        if self._dirty:
-            self.save()
-            self._dirty = False
+        pass
 
     def is_step_completed(self, old_username: str, step: str) -> bool:
         cp = self._checkpoints.get(old_username)
@@ -137,10 +135,21 @@ class CheckpointManager:
             return False
         return step in cp.steps_completed
 
+    MAX_RETRIES = 3
+
     def get_pending(self) -> List[UserCheckpoint]:
+        pending = []
+        for cp in self._checkpoints.values():
+            if cp.status in (CheckpointStatus.PENDING, CheckpointStatus.IN_PROGRESS, CheckpointStatus.FAILED):
+                if cp.retry_count >= self.MAX_RETRIES:
+                    continue
+                pending.append(cp)
+        return pending
+
+    def get_permanently_failed(self) -> List[UserCheckpoint]:
         return [
             cp for cp in self._checkpoints.values()
-            if cp.status in (CheckpointStatus.PENDING, CheckpointStatus.IN_PROGRESS, CheckpointStatus.FAILED)
+            if cp.status == CheckpointStatus.FAILED and cp.retry_count >= self.MAX_RETRIES
         ]
 
     def get_all(self) -> List[UserCheckpoint]:
@@ -157,8 +166,17 @@ class CheckpointManager:
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "checkpoints": [cp.to_dict() for cp in self._checkpoints.values()],
         }
-        with open(save_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=save_path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp_path, save_path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def load(self, path: Path) -> None:
         if not path.exists():

@@ -25,7 +25,7 @@ class UserAlreadyExistsError(TableauMigrateError):
     pass
 
 
-class PermissionError(TableauMigrateError):
+class TableauPermissionError(TableauMigrateError):
     pass
 
 
@@ -39,3 +39,10 @@ class ValidationError(TableauMigrateError):
 
 class ConfigurationError(TableauMigrateError):
     pass
+
+
+def is_conflict_error(exc: Exception) -> bool:
+    if isinstance(exc, APIError) and exc.status_code == 409:
+        return True
+    exc_str = str(exc).lower()
+    return "409" in exc_str or "already exists" in exc_str

@@ -3,6 +3,8 @@
 import asyncio
 import json
 import logging
+import os
+import tempfile
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -176,6 +178,11 @@ class DimensionCache:
             "extra_attrs": ["workbook", "view", "datasource", "project", "flow"],
         },
         "custom_view_default_users": {
+            "id_fields": ["id"],
+            "name_field": "name",
+            "extra_attrs": ["siteRole"],
+        },
+        "data_alert_recipients": {
             "id_fields": ["id"],
             "name_field": "name",
             "extra_attrs": ["siteRole"],
@@ -482,8 +489,17 @@ class DimensionCache:
             return False
         self._created_at = self._created_at or datetime.now()
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(save_path, "w") as f:
-            json.dump(self.to_dict(), f, indent=2)
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=save_path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(tmp_fd, "w") as f:
+                json.dump(self.to_dict(), f, indent=2)
+            os.replace(tmp_path, save_path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
         print_status("CACHE", f"Saved {self.total_records} records to {save_path}")
         return True
 
@@ -745,6 +761,7 @@ class DimensionCache:
                             "user_id": pid,
                             "group_id": pid,
                             "custom_view_id": pid,
+                            "alert_id": pid,
                         }
                         raw_path = path_tpl.format(**{k: v for k, v in placeholders.items() if f"{{{k}}}" in path_tpl})
                         api_path = f"/{raw_path}" if not raw_path.startswith("/") else raw_path

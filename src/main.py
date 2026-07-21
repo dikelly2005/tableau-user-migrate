@@ -3,6 +3,7 @@
 import asyncio
 import argparse
 import os
+import signal
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -109,7 +110,25 @@ def _find_previous_dry_run(log_location: Path, current_run_id: str) -> str | Non
     return candidates[0]
 
 
+_shutdown_requested = False
+
+
+def _handle_shutdown(signum, frame):
+    global _shutdown_requested
+    if _shutdown_requested:
+        print_status("WARN", "Second interrupt received — forcing exit")
+        sys.exit(1)
+    _shutdown_requested = True
+    print_status("WARN", "Shutdown requested — will stop after current user completes. Press Ctrl+C again to force exit.")
+
+
+def is_shutdown_requested() -> bool:
+    return _shutdown_requested
+
+
 async def main():
+    signal.signal(signal.SIGINT, _handle_shutdown)
+    signal.signal(signal.SIGTERM, _handle_shutdown)
     args = parse_args()
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -146,6 +165,10 @@ async def main():
             print_status("WARN", "No incomplete checkpoints found")
 
     if resuming:
+        checkpoint_mode = checkpoint._mode
+        if checkpoint_mode and checkpoint_mode != args.mode:
+            print_status("ERROR", f"Checkpoint is for mode '{checkpoint_mode}' but you specified '--mode {args.mode}'. Use --mode {checkpoint_mode} or start a new run.")
+            return
         pending = checkpoint.get_pending()
         mappings = [{"old_username": cp.old_username, "new_username": cp.new_username} for cp in checkpoint.get_all()]
         print_status("CHECKPOINT", f"Resuming {len(pending)} pending users from {checkpoint.total} total")
@@ -154,7 +177,7 @@ async def main():
         mappings = load_user_mappings(csv_path)
         print_status("GET", f"Loaded {len(mappings)} user mappings from {csv_path}")
 
-    if not args.yes and not resuming:
+    if not args.yes:
         confirm = ConfirmationManager(migrate_logger)
         confirmed = False
         if args.mode == "dry-run":
@@ -188,6 +211,11 @@ async def main():
             from src.services.ownership import OwnershipService
             from src.services.groups import GroupService
             from src.services.permissions import PermissionService
+            from src.services.favorites import FavoriteService
+            from src.services.subscriptions import SubscriptionService
+            from src.services.alerts import AlertService
+            from src.services.collections import CollectionService
+            from src.services.custom_views import CustomViewService
 
             cache = DimensionCache()
             await cache.warmup(client, endpoints_config, auth.site_id)
@@ -196,8 +224,17 @@ async def main():
             ownership_svc = OwnershipService(client, audit_logger, cache, endpoints_config)
             group_svc = GroupService(client, audit_logger, cache, endpoints_config)
             perm_svc = PermissionService(client, audit_logger, cache, endpoints_config)
+            fav_svc = FavoriteService(client, audit_logger, cache, endpoints_config)
+            sub_svc = SubscriptionService(client, audit_logger, cache, endpoints_config)
+            alert_svc = AlertService(client, audit_logger, cache, endpoints_config)
+            collection_svc = CollectionService(client, audit_logger, cache, endpoints_config)
+            cv_svc = CustomViewService(client, audit_logger, cache, endpoints_config)
 
-            rollback = RollbackWorkflow(user_svc, ownership_svc, group_svc, perm_svc, audit_logger)
+            rollback = RollbackWorkflow(
+                user_svc, ownership_svc, group_svc, perm_svc,
+                fav_svc, sub_svc, alert_svc, collection_svc, cv_svc,
+                audit_logger,
+            )
             stats = await rollback.execute(
                 Path(args.rollback),
                 delete_new_users=args.rollback_delete_users,
@@ -278,17 +315,27 @@ async def main():
                 authenticator=auth, http_client=base_client.http_client,
             )
             if args.batch_size and len(mappings) > args.batch_size:
-                # Process in batches, refreshing cache between each
                 total_failures = 0
+                failed_batches = []
+                total_batches = (len(mappings) + args.batch_size - 1) // args.batch_size
                 for batch_num, i in enumerate(range(0, len(mappings), args.batch_size), 1):
                     batch = mappings[i:i + args.batch_size]
-                    print_status("BATCH", f"Processing batch {batch_num} ({len(batch)} users, offset {i})")
-                    result = await workflow.execute(batch, audit_dir)
-                    total_failures += result.failed
+                    print_status("BATCH", f"Processing batch {batch_num}/{total_batches} ({len(batch)} users, offset {i})")
+                    try:
+                        result = await workflow.execute(batch, audit_dir)
+                        total_failures += result.failed
+                    except Exception as e:
+                        logger.error(f"Batch {batch_num} failed with exception: {e}")
+                        print_status("ERROR", f"Batch {batch_num} failed: {e}")
+                        total_failures += len(batch)
+                        failed_batches.append(batch_num)
                     if i + args.batch_size < len(mappings):
                         print_status("CACHE", f"Refreshing cache before next batch...")
+                        cache.refresh()
                         await cache.warmup(client, endpoints_config, auth.site_id)
-                if total_failures:
+                if failed_batches:
+                    print_status("WARN", f"Batches {failed_batches} failed — {total_failures} total user failures across batches")
+                elif total_failures:
                     print_status("WARN", f"{total_failures} users failed across batches — check audit log")
             else:
                 result = await workflow.execute(mappings, audit_dir)

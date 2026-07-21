@@ -85,7 +85,7 @@
    grep '"status":"failed"' audit/checkpoints/checkpoint_*.json
    ```
 3. Fix the underlying issue (permissions, user not found, etc.)
-4. Resume — failed users are automatically retried:
+4. Resume — failed users are automatically retried (up to 3 attempts; after that they are permanently skipped):
    ```bash
    python -m src.main --resume-latest
    ```

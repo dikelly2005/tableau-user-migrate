@@ -30,7 +30,8 @@ audit/checkpoints/checkpoint_YYYYMMDD_HHMMSS.json
       "steps_completed": ["create_user", "clone_permissions", "clone_groups", ...],
       "started_at": "2026-04-13T12:00:01+00:00",
       "updated_at": "2026-04-13T12:02:15+00:00",
-      "error": null
+      "error": null,
+      "retry_count": 0
     },
     {
       "old_username": "bob@old.com",
@@ -39,7 +40,8 @@ audit/checkpoints/checkpoint_YYYYMMDD_HHMMSS.json
       "steps_completed": ["create_user", "clone_permissions"],
       "started_at": "2026-04-13T12:02:16+00:00",
       "updated_at": "2026-04-13T12:03:45+00:00",
-      "error": "API error 500: Internal server error"
+      "error": "API error 500: Internal server error",
+      "retry_count": 1
     },
     {
       "old_username": "charlie@old.com",
@@ -48,7 +50,8 @@ audit/checkpoints/checkpoint_YYYYMMDD_HHMMSS.json
       "steps_completed": [],
       "started_at": null,
       "updated_at": null,
-      "error": null
+      "error": null,
+      "retry_count": 0
     }
   ]
 }
@@ -81,7 +84,8 @@ Use this when you have multiple checkpoint files and want to target a specific r
 | `completed` | Skipped entirely — no API calls |
 | `pending` | Processed from the beginning |
 | `in_progress` | Resumes from last completed step |
-| `failed` | Retried from last completed step |
+| `failed` (retry_count < 3) | Retried from last completed step |
+| `failed` (retry_count ≥ 3) | Permanently skipped — manual intervention required |
 
 For `in_progress` and `failed` users, the step-level tracking ensures we don't repeat work:
 

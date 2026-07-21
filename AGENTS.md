@@ -103,11 +103,12 @@ tableau_user_migrate/
 │   └── utils/
 │       ├── cache.py                 # DimensionCache: ATTRIBUTE_MAPPINGS, three-pass warmup,
 │       │                            #   enrichment passes, populate/get_ids/filter_fn, child endpoints, save/load/TTL
-│       ├── checkpoint.py            # Per-user, per-step JSON checkpoints
+│       ├── checkpoint.py            # Per-user, per-step JSON checkpoints (retry_count, MAX_RETRIES=3)
 │       ├── csv_loader.py            # CSV validation + case-insensitive normalization
 │       ├── exceptions.py            # TableauMigrateError hierarchy
 │       ├── confirmations.py         # Interactive CLI prompts
 │       ├── paths.py                 # Endpoint path + element tag resolution
+│       ├── xml_escape.py            # XML attribute/text escaping for safe payload construction
 │       └── logging_config.py        # get_logger() + print_status()
 │
 ├── models/
@@ -229,6 +230,8 @@ Defined for: `users`, `groups`, `projects` (incl. owner), `workbooks`, `views`, 
 For per-parent child endpoints:
 - `group_users` (parent: groups) — who is in each group
 - `user_favorites` (parent: users) — what each user has favorited
+- `custom_view_default_users` (parent: custom_views) — who has each custom view set as default
+- `data_alert_recipients` (parent: data_alerts) — who is a recipient of each alert
 
 ### Three-Pass Warmup
 1. **Primary pass**: Fetch all endpoints with `cache: true` and no `parent`. Populates `DimensionRecord` per item. JSON endpoints use `format: json` with `response_key`.
@@ -245,8 +248,8 @@ Services query cache using `get_ids(endpoint, filter_fn)`:
 
 ### Zero Per-User List Calls
 Every service reads exclusively from cache during workflow execution. Only mutation API calls (POST/PUT/DELETE) hit the server per user. Exceptions:
-- `CustomViewService._is_default_for_user()` — targeted GET per custom view to check default user status
-- `AlertService._get_alert_recipients()` — GET per non-owned alert to check recipient membership during clone
+- `CustomViewService._is_default_for_user()` — targeted GET per custom view to check default user status (fallback when `custom_view_default_users` cache miss)
+- `AlertService._get_alert_recipients()` — reads from `data_alert_recipients` cache; falls back to GET per alert only on cache miss
 
 ---
 

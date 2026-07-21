@@ -184,19 +184,22 @@ endpoints:
   # METADATA (external assets with permissions)
   # ===========================================================================
 
-  # databases:
-  #   path: "sites/{site_id}/databases"
-  #   response_key: databases.database
-  #   cache: true
-  #   permissions_endpoint: "sites/{site_id}/databases/{id}/permissions"
+  databases:
+    path: "sites/{site_id}/databases"
+    response_key: databases.database
+    cache: true
+    permissions_endpoint: "sites/{site_id}/databases/{id}/permissions"
+    auth_type: pat
 
-  # tables:
-  #   path: "sites/{site_id}/tables"
-  #   response_key: tables.table
-  #   cache: true
-  #   permissions_endpoint: "sites/{site_id}/tables/{id}/permissions"
-  #   params:
-  #     pageSize: 1000
+  tables:
+    path: "sites/{site_id}/tables"
+    response_key: tables.table
+    cache: true
+    permissions_endpoint: "sites/{site_id}/tables/{id}/permissions"
+    params:
+      pageSize: 1000
+    scope: tableau:sites:read
+    scope_write: tableau:sites:create
 
   # ===========================================================================
   # COLLECTIONS
@@ -266,6 +269,13 @@ endpoints:
   data_alert_single:
     path: "sites/{site_id}/dataAlerts/{alert_id}"
     single_object: true
+    scope: tableau:data_driven_alerts:read
+    scope_write: tableau:data_driven_alerts:create
+
+  data_alert_recipients:
+    path: "sites/{site_id}/dataAlerts/{alert_id}/users"
+    response_key: users.user
+    parent: data_alerts
     scope: tableau:data_driven_alerts:read
     scope_write: tableau:data_driven_alerts:create
 

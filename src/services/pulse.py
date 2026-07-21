@@ -6,6 +6,7 @@ from typing import List, Dict, Optional
 from src.api.client import TableauAPIClient
 from src.utils.cache import DimensionCache
 from src.utils.paths import resolve_endpoint_path
+from src.utils.exceptions import is_conflict_error
 from reporting.audit import AuditLogger, AuditAction
 from src.utils.logging_config import get_logger, print_status
 
@@ -28,6 +29,9 @@ class PulseService:
         return resolve_endpoint_path(ep_config["path"], self._client.site_id, **kwargs)
 
     def _get_subscriptions_from_cache(self, user_id: str) -> List[Dict]:
+        if not self._cache.has_dimension("pulse_subscriptions"):
+            logger.warning("Cache miss for 'pulse_subscriptions' — dimension not populated. Results may be incomplete.")
+            return []
         records = self._cache.get_all_records("pulse_subscriptions")
         results = []
         for r in records:
@@ -99,7 +103,7 @@ class PulseService:
                     details={"metric_id": metric_id},
                 )
             except Exception as e:
-                if "409" in str(e) or "already exists" in str(e).lower():
+                if is_conflict_error(e):
                     self._audit.log_skipped(
                         AuditAction.CLONE_PULSE_SUBSCRIPTION,
                         reason="Pulse subscription already exists",
@@ -153,6 +157,9 @@ class PulseService:
         return removed
 
     def _get_alerts_from_cache(self, user_id: str) -> List[Dict]:
+        if not self._cache.has_dimension("pulse_alerts"):
+            logger.warning("Cache miss for 'pulse_alerts' — dimension not populated. Results may be incomplete.")
+            return []
         records = self._cache.get_all_records("pulse_alerts")
         results = []
         for r in records:

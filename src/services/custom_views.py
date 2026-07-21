@@ -1,5 +1,6 @@
 # Tableau custom view ownership transfer service
 # Co-authored with CoCo
+import asyncio
 from typing import List
 
 from src.api.client import TableauAPIClient, _findall_any, _find_any
@@ -26,6 +27,9 @@ class CustomViewService:
         return resolve_endpoint_path(ep_config["path"], self._client.site_id, **kwargs)
 
     async def get_user_custom_views(self, user_id: str, username: str) -> List[UXArtifact]:
+        if not self._cache.has_dimension("custom_views"):
+            logger.warning("Cache miss for 'custom_views' — dimension not populated. Results may be incomplete.")
+            return []
         cv_ids = self._cache.get_ids("custom_views", filter_fn=owner_filter(user_id))
         cvs = []
         for cid in cv_ids:
@@ -86,9 +90,31 @@ class CustomViewService:
             logger.debug(f"Failed to check default users for custom view {custom_view_id}: {e}")
         return False
 
-    async def _set_default_for_user(self, custom_view_id: str, user_id: str) -> None:
+    async def _get_other_default_users(self, custom_view_id: str, exclude_user_id: str) -> List[str]:
+        endpoint = self._resolve_path("custom_view_default_users", custom_view_id=custom_view_id)
+        try:
+            root = await self._client.get(endpoint)
+            return [
+                user_el.get("id") for user_el in _findall_any(root, "user")
+                if user_el.get("id") and user_el.get("id") != exclude_user_id
+            ]
+        except Exception as e:
+            logger.debug(f"Failed to get default users for custom view {custom_view_id}: {e}")
+            return []
+
+    async def _set_default_for_user(self, custom_view_id: str, user_id: str, retries: int = 5) -> None:
         endpoint = self._resolve_path("custom_view_default_user_single", custom_view_id=custom_view_id, user_id=user_id)
-        await self._client.post(endpoint, "<tsRequest/>")
+        for attempt in range(retries):
+            try:
+                await self._client.post(endpoint, "<tsRequest/>")
+                return
+            except Exception as e:
+                if "404" in str(e) and attempt < retries - 1:
+                    delay = 3 * (2 ** attempt)
+                    logger.debug(f"Retry {attempt + 1}/{retries} for set_default (404) on CV {custom_view_id}, waiting {delay}s")
+                    await asyncio.sleep(delay)
+                else:
+                    raise
 
     async def _remove_default_for_user(self, custom_view_id: str, user_id: str) -> None:
         endpoint = self._resolve_path("custom_view_default_user_single", custom_view_id=custom_view_id, user_id=user_id)
@@ -119,10 +145,12 @@ class CustomViewService:
                 transferred += 1
                 self._cache.invalidate_owner("custom_views", cv.artifact_id, new_user_id)
 
+                default_ok = False
                 if was_default:
                     try:
                         await self._set_default_for_user(cv.artifact_id, new_user_id)
                         await self._remove_default_for_user(cv.artifact_id, old_user_id)
+                        default_ok = True
                     except Exception as e:
                         logger.warning(f"Failed to transfer default status for custom view {cv.artifact_id}: {e}")
 
@@ -133,7 +161,7 @@ class CustomViewService:
                     object_type="custom_view",
                     object_name=cv.content_name,
                     object_id=cv.artifact_id,
-                    details={"ownership_transferred": True, "default_transferred": was_default},
+                    details={"ownership_transferred": True, "default_transferred": default_ok},
                 )
             except Exception as e:
                 logger.warning(f"Failed to transfer custom view {cv.artifact_id}: {e}")
@@ -153,8 +181,22 @@ class CustomViewService:
         print_status("START", f"Removing custom views from {username}")
         custom_views = await self.get_user_custom_views(user_id, username)
         removed = 0
+        skipped = 0
 
         for cv in custom_views:
+            other_default_users = await self._get_other_default_users(cv.artifact_id, user_id)
+            if other_default_users:
+                skipped += 1
+                self._audit.log_skipped(
+                    AuditAction.REMOVE_CUSTOM_VIEW,
+                    reason=f"Custom view has {len(other_default_users)} other default users — not deleting",
+                    old_username=username,
+                    object_type="custom_view",
+                    object_id=cv.artifact_id,
+                )
+                print_status("SKIP", f"Custom view '{cv.content_name}' has {len(other_default_users)} other default users — not deleting")
+                continue
+
             endpoint = self._resolve_path("custom_view_single", custom_view_id=cv.artifact_id)
             try:
                 await self._client.delete(endpoint)
@@ -164,7 +206,9 @@ class CustomViewService:
                 logger.warning(f"Failed to remove custom view: {e}")
                 self._audit.log_failure(AuditAction.REMOVE_CUSTOM_VIEW, error_message=str(e), old_username=username, object_id=cv.artifact_id)
 
-        print_status("DONE", f"Removed {removed} custom views from {username}")
+        if skipped:
+            print_status("SKIP", f"Skipped {skipped} custom views with other default users for {username}")
+        print_status("DONE", f"Removed {removed} custom views from {username} ({skipped} skipped)")
         return removed
 
     async def clone_custom_view_defaults(
@@ -235,3 +279,13 @@ class CustomViewService:
 
         print_status("DONE", f"Removed {removed} custom view default-user associations from {username}")
         return removed
+
+    async def transfer_ownership(self, custom_view_id: str, new_owner_id: str, new_owner_username: str) -> None:
+        endpoint = self._resolve_path("custom_view_single", custom_view_id=custom_view_id)
+        payload = (
+            f'<tsRequest><customView>'
+            f'<owner id="{new_owner_id}"/>'
+            f'</customView></tsRequest>'
+        )
+        await self._client.put(endpoint, payload)
+        self._cache.invalidate_owner("custom_views", custom_view_id, new_owner_id)

@@ -5,6 +5,7 @@ from typing import List, Dict
 from src.api.client import TableauAPIClient
 from src.utils.cache import DimensionCache
 from src.utils.paths import resolve_endpoint_path
+from src.utils.exceptions import is_conflict_error
 from reporting.audit import AuditLogger, AuditAction
 from src.utils.logging_config import get_logger, print_status
 
@@ -32,7 +33,7 @@ class GroupService:
             if not group_id:
                 continue
             group_record = self._cache.get_record("groups", group_id)
-            group_name = group_record.name if group_record else r.name or group_id
+            group_name = (group_record.name if group_record else r.name) or group_id
             if group_name.lower() == "all users":
                 continue
             groups.append({"id": group_id, "name": group_name})
@@ -57,7 +58,7 @@ class GroupService:
             await self._client.post(endpoint, payload)
             self._audit.log_success(AuditAction.ADD_TO_GROUP, new_username=username, object_type="group", object_name=group_name, object_id=group_id)
         except Exception as e:
-            if "409" in str(e) or "already" in str(e).lower():
+            if is_conflict_error(e):
                 self._audit.log_skipped(AuditAction.ADD_TO_GROUP, reason="User already in group", new_username=username, object_type="group", object_name=group_name)
             else:
                 self._audit.log_failure(AuditAction.ADD_TO_GROUP, error_message=str(e), new_username=username, object_type="group", object_id=group_id)

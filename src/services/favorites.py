@@ -5,6 +5,8 @@ from typing import List
 from src.api.client import TableauAPIClient, _findall_any
 from src.utils.cache import DimensionCache
 from src.utils.paths import resolve_endpoint_path
+from src.utils.exceptions import is_conflict_error
+from src.utils.xml_escape import xml_attr_val
 from models.impact import UXArtifact
 from reporting.audit import AuditLogger, AuditAction
 from src.utils.logging_config import get_logger, print_status
@@ -72,7 +74,7 @@ class FavoriteService:
 
         for fav in favorites:
             endpoint = self._resolve_path("user_favorites", user_id=new_user_id)
-            label = fav.content_name or "Favorite"
+            label = xml_attr_val(fav.content_name or "Favorite")
             payload = (
                 f'<tsRequest><favorite label="{label}">'
                 f'<{fav.content_type} id="{fav.content_id}"/>'
@@ -84,7 +86,7 @@ class FavoriteService:
                 cloned += 1
                 self._audit.log_success(AuditAction.CLONE_FAVORITE, new_username=new_username, object_type="favorite", object_name=fav.content_name)
             except Exception as e:
-                if "409" in str(e) or "already exists" in str(e).lower():
+                if is_conflict_error(e):
                     self._audit.log_skipped(AuditAction.CLONE_FAVORITE, reason="Favorite already exists", new_username=new_username)
                     cloned += 1
                 else:
@@ -104,7 +106,13 @@ class FavoriteService:
             try:
                 await self._client.delete(endpoint)
                 removed += 1
-                self._audit.log_success(AuditAction.REMOVE_FAVORITE, old_username=username, object_type="favorite", object_name=fav.content_name)
+                self._audit.log_success(
+                    AuditAction.REMOVE_FAVORITE,
+                    old_username=username,
+                    object_type=fav.content_type,
+                    object_id=fav.content_id,
+                    object_name=fav.content_name,
+                )
             except Exception as e:
                 if "404" in str(e) or "Not Found" in str(e):
                     self._audit.log_skipped(
@@ -128,3 +136,20 @@ class FavoriteService:
             print_status("WARN", f"Found {len(favorites)} favorites but removed 0 for {username}")
         print_status("DONE", f"Removed {removed}/{len(favorites)} favorites from {username}")
         return removed
+
+    async def remove_single_favorite(self, user_id: str, username: str, content_type: str, content_id: str) -> None:
+        endpoint = self._resolve_path("user_favorite_single", user_id=user_id, content_type=content_type, content_id=content_id)
+        await self._client.delete(endpoint)
+
+    async def add_favorite(self, user_id: str, username: str, content_type: str, content_id: str) -> None:
+        endpoint = self._resolve_path("user_favorites", user_id=user_id)
+        label_map = {
+            "workbook": "workbook",
+            "view": "view",
+            "datasource": "datasource",
+            "flow": "flow",
+            "project": "project",
+        }
+        label = label_map.get(content_type, content_type)
+        payload = f'<tsRequest><favorite label=""><{label} id="{content_id}"/></favorite></tsRequest>'
+        await self._client.post(endpoint, payload)

@@ -2,9 +2,11 @@
 # Co-authored with CoCo
 from typing import List
 
-from src.api.client import TableauAPIClient, _findall_any, _find_any
+from src.api.client import TableauAPIClient
 from src.utils.cache import DimensionCache, user_filter
 from src.utils.paths import resolve_endpoint_path
+from src.utils.exceptions import is_conflict_error
+from src.utils.xml_escape import xml_attr_val
 from models.impact import UXArtifact
 from reporting.audit import AuditLogger, AuditAction
 from src.utils.logging_config import get_logger, print_status
@@ -26,6 +28,9 @@ class SubscriptionService:
         return resolve_endpoint_path(ep_config["path"], self._client.site_id, **kwargs)
 
     async def get_user_subscriptions(self, user_id: str, username: str) -> List[UXArtifact]:
+        if not self._cache.has_dimension("subscriptions"):
+            logger.warning("Cache miss for 'subscriptions' — dimension not populated. Results may be incomplete.")
+            return []
         sub_ids = self._cache.get_ids("subscriptions", filter_fn=user_filter(user_id))
         subs = []
         for sid in sub_ids:
@@ -76,9 +81,13 @@ class SubscriptionService:
             )
             intervals_xml = f'<intervals>{inner}</intervals>'
 
+        end_attr = ""
+        if frequency in ("Daily", "Hourly"):
+            end_attr = f' end="{end}"'
+
         return (
             f'<schedule frequency="{frequency}">'
-            f'<frequencyDetails start="{start}" end="{end}">'
+            f'<frequencyDetails start="{start}"{end_attr}>'
             f'{intervals_xml}'
             f'</frequencyDetails>'
             f'</schedule>'
@@ -109,7 +118,7 @@ class SubscriptionService:
 
             payload = (
                 '<tsRequest>'
-                f'<subscription subject="{subject}">'
+                f'<subscription subject="{xml_attr_val(subject)}">'
                 f'<content id="{content_id}" type="{content_type}" sendIfViewEmpty="{send_if_empty}"/>'
                 f'<user id="{new_user_id}"/>'
                 f'</subscription>'
@@ -123,8 +132,12 @@ class SubscriptionService:
                 self._audit.log_success(AuditAction.CLONE_SUBSCRIPTION, new_username=new_username, object_type="subscription", object_id=sub.artifact_id, details={"subject": subject})
             except Exception as e:
                 error_str = str(e)
-                logger.warning(f"Failed to create subscription '{subject}': {e}")
-                self._audit.log_failure(AuditAction.CLONE_SUBSCRIPTION, error_message=error_str[:300], new_username=new_username, object_id=sub.artifact_id)
+                if is_conflict_error(e):
+                    cloned += 1
+                    self._audit.log_skipped(AuditAction.CLONE_SUBSCRIPTION, reason="Subscription already exists", new_username=new_username, object_type="subscription", object_id=sub.artifact_id)
+                else:
+                    logger.warning(f"Failed to create subscription '{subject}': {e}")
+                    self._audit.log_failure(AuditAction.CLONE_SUBSCRIPTION, error_message=error_str[:300], new_username=new_username, object_id=sub.artifact_id)
 
         print_status("DONE", f"Cloned {cloned} subscriptions for {new_username}")
         return cloned
@@ -139,9 +152,23 @@ class SubscriptionService:
             try:
                 await self._client.delete(endpoint)
                 removed += 1
-                self._audit.log_success(AuditAction.REMOVE_SUBSCRIPTION, old_username=username, object_type="subscription", object_id=sub.artifact_id)
+                self._audit.log_success(
+                    AuditAction.REMOVE_SUBSCRIPTION,
+                    old_username=username,
+                    object_type="subscription",
+                    object_id=sub.artifact_id,
+                    object_name=sub.artifact_name,
+                    details={
+                        "content_type": sub.content_type,
+                        "content_id": sub.content_id,
+                    },
+                )
             except Exception as e:
                 logger.warning(f"Failed to remove subscription: {e}")
 
         print_status("DONE", f"Removed {removed} subscriptions from {username}")
         return removed
+
+    async def remove_single_subscription(self, subscription_id: str, username: str) -> None:
+        endpoint = self._resolve_path("subscription_single", subscription_id=subscription_id)
+        await self._client.delete(endpoint)

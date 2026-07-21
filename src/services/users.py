@@ -4,7 +4,7 @@ from typing import Optional, Dict
 
 from src.api.client import TableauAPIClient, _findall_any, _find_any, _strip_ns
 from src.utils.cache import DimensionCache
-from src.utils.exceptions import TableauMigrateError
+from src.utils.exceptions import TableauMigrateError, is_conflict_error
 from src.utils.paths import resolve_endpoint_path
 from reporting.audit import AuditLogger, AuditAction
 from src.utils.logging_config import get_logger, print_status
@@ -38,7 +38,7 @@ class UserService:
                         "auth_setting": r.attrs.get("authSetting"),
                     }
 
-        endpoint = self._resolve_path("users") + f"?filter=name:eq:{username}"
+        endpoint = self._resolve_path("users") + f"?filter=name:eq:{username.lower()}"
         root = await self._client.get(endpoint)
         users = _findall_any(root, "user")
 
@@ -79,7 +79,7 @@ class UserService:
             print_status("POST", f"Created user: {username} ({site_role})")
             return result
         except Exception as e:
-            if "409" in str(e) or "already exists" in str(e).lower():
+            if is_conflict_error(e):
                 existing = await self.lookup_user(username, live=True)
                 if existing:
                     needs_update = (
@@ -130,9 +130,20 @@ class UserService:
         print_status("PUT", f"Updated user {username}: {', '.join(parts)}")
 
     async def deactivate_user(self, user_id: str, username: str) -> None:
+        original_role = None
+        if self._cache and self._cache.has_dimension("users"):
+            record = self._cache.get_record("users", user_id)
+            if record:
+                original_role = record.type
+        if not original_role:
+            user_info = await self.lookup_user(username, live=True)
+            if user_info:
+                original_role = user_info.get("site_role")
+
         await self.update_user(user_id, username, "Unlicensed")
         self._audit.log_success(
             AuditAction.USER_DEACTIVATE,
             old_username=username,
+            details={"original_site_role": original_role or "Unknown"},
         )
-        print_status("PUT", f"Deactivated (unlicensed): {username}")
+        print_status("PUT", f"Deactivated (unlicensed): {username} (was {original_role or 'Unknown'})")

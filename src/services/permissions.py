@@ -6,6 +6,7 @@ from typing import List, Dict
 from src.api.client import TableauAPIClient
 from src.utils.cache import DimensionCache
 from src.utils.paths import resolve_endpoint_path
+from src.utils.exceptions import is_conflict_error
 from reporting.audit import AuditLogger, AuditAction
 from src.utils.logging_config import get_logger, print_status
 
@@ -174,7 +175,7 @@ class PermissionService:
                             details={"capability": p["capability_name"], "mode": p["capability_mode"]},
                         )
                 except Exception as e:
-                    if "409" in str(e) or "already exists" in str(e).lower():
+                    if is_conflict_error(e):
                         cloned["n"] += len(perm_list)
                         for p in perm_list:
                             self._audit.log_skipped(
@@ -247,7 +248,11 @@ class PermissionService:
                         old_username=username,
                         object_type=p["content_type"],
                         object_id=p["content_id"],
-                        details={"capability": p["capability_name"]},
+                        details={
+                            "capability": p["capability_name"],
+                            "capability_mode": p["capability_mode"],
+                            "is_default": p.get("is_default", False),
+                        },
                     )
                 except Exception as e:
                     if "403" in str(e) or "Forbidden" in str(e):
@@ -352,3 +357,26 @@ class PermissionService:
                         return wb_project.get("id")
 
         return None
+
+    async def remove_single_permission(
+        self, content_type: str, content_id: str, user_id: str, capability: str, mode: str
+    ) -> None:
+        perm_path = self._resolve_perm_path(content_type, content_id)
+        if not perm_path:
+            raise ValueError(f"Cannot resolve permission path for {content_type}/{content_id}")
+        delete_path = f"{perm_path}/users/{user_id}/{capability}/{mode}"
+        await self._client.delete(delete_path)
+
+    async def grant_single_permission(
+        self, content_type: str, content_id: str, user_id: str, capability: str, mode: str
+    ) -> None:
+        perm_path = self._resolve_perm_path(content_type, content_id)
+        if not perm_path:
+            raise ValueError(f"Cannot resolve permission path for {content_type}/{content_id}")
+        payload = (
+            '<tsRequest><permissions><granteeCapabilities>'
+            f'<user id="{user_id}"/>'
+            f'<capabilities><capability name="{capability}" mode="{mode}"/></capabilities>'
+            '</granteeCapabilities></permissions></tsRequest>'
+        )
+        await self._client.put(perm_path, payload)

@@ -6,6 +6,7 @@ from typing import List, Dict, Optional
 from src.api.client import TableauAPIClient, _findall_any
 from src.utils.cache import DimensionCache, owner_filter
 from src.utils.paths import resolve_endpoint_path
+from src.utils.exceptions import is_conflict_error
 from reporting.audit import AuditLogger, AuditAction
 from src.utils.logging_config import get_logger, print_status
 
@@ -32,6 +33,9 @@ class CollectionService:
         return resolve_endpoint_path(ep_config["path"], self._client.site_id, **kwargs)
 
     def get_user_collections(self, user_id: str, username: str) -> List[Dict]:
+        if not self._cache.has_dimension("collections"):
+            logger.warning("Cache miss for 'collections' — dimension not populated. Results may be incomplete.")
+            return []
         collection_ids = self._cache.get_ids("collections", filter_fn=owner_filter(user_id))
         collections = []
         for cid in collection_ids:
@@ -87,7 +91,7 @@ class CollectionService:
                 )
                 added += 1
             except Exception as e:
-                if "409" in str(e) or "already exists" in str(e).lower():
+                if is_conflict_error(e):
                     added += 1
                 else:
                     logger.warning(f"Failed to add item {item_type}/{item_id} to collection {collection_luid}: {e}")
@@ -166,7 +170,7 @@ class CollectionService:
                     )
                     cloned += 1
                 except Exception as e:
-                    if "409" in str(e) or "already exists" in str(e).lower():
+                    if is_conflict_error(e):
                         cloned += 1
                     else:
                         logger.warning(f"Failed to clone collection permission: {e}")
@@ -197,6 +201,22 @@ class CollectionService:
                 items = await self._get_collection_items(old_luid)
                 new_coll = await self._create_collection(coll_name, coll.get("description"))
                 new_luid = new_coll.get("luid") or new_coll.get("id")
+
+                if not new_luid:
+                    logger.warning(
+                        f"Collection '{coll_name}': new collection ID is None. "
+                        f"Skipping delete of old collection {old_luid}."
+                    )
+                    self._audit.log_failure(
+                        AuditAction.CLONE_COLLECTION,
+                        error_message="New collection ID is None — old collection preserved.",
+                        old_username=old_username,
+                        new_username=new_username,
+                        object_type="collection",
+                        object_name=coll_name,
+                        object_id=old_luid,
+                    )
+                    continue
 
                 items_added = await self._add_collection_items(new_luid, items)
                 perms_cloned = await self._clone_collection_permissions(old_luid, new_luid, old_user_id, new_user_id)
@@ -354,3 +374,6 @@ class CollectionService:
 
         print_status("DONE", f"Removed {removed} collections from {username}")
         return removed
+
+    async def delete_collection(self, collection_id: str) -> None:
+        await self._delete_collection(collection_id)

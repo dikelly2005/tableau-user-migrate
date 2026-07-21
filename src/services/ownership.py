@@ -6,6 +6,7 @@ from typing import List, Dict, Optional
 from src.api.client import TableauAPIClient, _find_any
 from src.utils.cache import DimensionCache, owner_filter
 from src.utils.paths import resolve_endpoint_path, resolve_element_tag
+from src.utils.xml_escape import xml_attr_val
 from reporting.audit import AuditLogger, AuditAction
 from src.utils.logging_config import get_logger, print_status
 
@@ -158,7 +159,7 @@ class OwnershipService:
             self._endpoints["projects"]["path"], self._client.site_id
         )
         payload = (
-            f'<tsRequest><project name="{project_name}" '
+            f'<tsRequest><project name="{xml_attr_val(project_name)}" '
             f'description="Content relocated from Personal Space during user migration"/>'
             f'</tsRequest>'
         )

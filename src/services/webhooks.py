@@ -6,6 +6,7 @@ import json
 from src.api.client import TableauAPIClient
 from src.utils.cache import DimensionCache, owner_filter
 from src.utils.paths import resolve_endpoint_path
+from src.utils.exceptions import is_conflict_error
 from reporting.audit import AuditLogger, AuditAction
 from src.utils.logging_config import get_logger, print_status
 
@@ -26,6 +27,9 @@ class WebhookService:
         return resolve_endpoint_path(ep_config["path"], self._client.site_id, **kwargs)
 
     def get_user_webhooks(self, user_id: str, username: str) -> List[Dict]:
+        if not self._cache.has_dimension("webhooks"):
+            logger.warning("Cache miss for 'webhooks' — dimension not populated. Results may be incomplete.")
+            return []
         webhook_ids = self._cache.get_ids("webhooks", filter_fn=owner_filter(user_id))
         webhooks = []
         for wid in webhook_ids:
@@ -77,14 +81,19 @@ class WebhookService:
                     object_id=wh["webhook_id"],
                 )
             except Exception as e:
-                logger.warning(f"Failed to transfer webhook {wh['webhook_id']}: {e}")
-                self._audit.log_failure(
-                    AuditAction.CLONE_WEBHOOK,
-                    error_message=str(e),
-                    old_username=old_username,
-                    new_username=new_username,
-                    object_id=wh["webhook_id"],
-                )
+                error_str = str(e)
+                if is_conflict_error(e):
+                    self._audit.log_skipped(AuditAction.CLONE_WEBHOOK, reason="Webhook already transferred", new_username=new_username, object_type="webhook", object_id=wh["webhook_id"])
+                    cloned += 1
+                else:
+                    logger.warning(f"Failed to transfer webhook {wh['webhook_id']}: {e}")
+                    self._audit.log_failure(
+                        AuditAction.CLONE_WEBHOOK,
+                        error_message=error_str,
+                        old_username=old_username,
+                        new_username=new_username,
+                        object_id=wh["webhook_id"],
+                    )
 
         print_status("DONE", f"Transferred {cloned} webhooks to {new_username}")
         return cloned

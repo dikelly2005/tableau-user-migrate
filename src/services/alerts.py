@@ -6,7 +6,7 @@ from typing import List
 from src.api.client import TableauAPIClient, _findall_any, _find_any
 from src.utils.cache import DimensionCache, owner_filter
 from src.utils.paths import resolve_endpoint_path
-from src.utils.exceptions import APIError
+from src.utils.exceptions import APIError, is_conflict_error
 from models.impact import UXArtifact
 from reporting.audit import AuditLogger, AuditAction
 from src.utils.logging_config import get_logger, print_status
@@ -31,6 +31,9 @@ class AlertService:
         return resolve_endpoint_path(ep_config["path"], self._client.site_id, **kwargs)
 
     async def get_user_alerts(self, user_id: str, username: str) -> List[UXArtifact]:
+        if not self._cache.has_dimension("data_alerts"):
+            logger.warning("Cache miss for 'data_alerts' — dimension not populated. Results may be incomplete.")
+            return []
         alert_ids = self._cache.get_ids("data_alerts", filter_fn=owner_filter(user_id))
         alerts = []
         for aid in alert_ids:
@@ -53,7 +56,7 @@ class AlertService:
 
     @staticmethod
     def _is_conflict(exc: Exception) -> bool:
-        return "409" in str(exc) or "already exists" in str(exc).lower()
+        return is_conflict_error(exc)
 
     async def _add_recipient_with_retry(
         self,
@@ -85,7 +88,14 @@ class AlertService:
                 raise
         return False
 
+    def _get_cached_recipients(self, alert_id: str) -> List[str]:
+        child_ids = self._cache.get_child_ids("data_alert_recipients", alert_id)
+        return child_ids
+
     async def _get_alert_recipients(self, alert_id: str) -> List[str]:
+        cached = self._get_cached_recipients(alert_id)
+        if cached:
+            return cached
         endpoint = self._resolve_path("data_alert_single", alert_id=alert_id)
         try:
             root = await self._client.get(endpoint)
@@ -137,6 +147,7 @@ class AlertService:
                 )
                 try:
                     await self._client.put(transfer_endpoint, transfer_payload)
+                    cloned += 1
                     self._audit.log_success(
                         AuditAction.CLONE_ALERT,
                         old_username=old_username,
@@ -155,6 +166,7 @@ class AlertService:
                         object_id=alert.artifact_id,
                     )
             else:
+                cloned += 1
                 self._audit.log_success(
                     AuditAction.CLONE_ALERT,
                     old_username=old_username,
@@ -163,7 +175,6 @@ class AlertService:
                     object_id=alert.artifact_id,
                     details={"recipient_only": True, "ownership_kept_by_old_user": True},
                 )
-            cloned += 1
 
         all_alert_ids = self._cache.get_ids("data_alerts")
         non_owned_ids = [aid for aid in all_alert_ids if aid not in owned_alert_ids]
@@ -202,10 +213,18 @@ class AlertService:
 
     async def remove_alerts(self, user_id: str, username: str) -> int:
         print_status("START", f"Removing alerts from {username}")
+        owned_alert_ids = set(self._cache.get_ids("data_alerts", filter_fn=owner_filter(user_id)))
         all_alert_ids = self._cache.get_ids("data_alerts")
-        removed = 0
+        non_owned_ids = [aid for aid in all_alert_ids if aid not in owned_alert_ids]
 
-        for aid in all_alert_ids:
+        target_ids = list(owned_alert_ids)
+        for aid in non_owned_ids:
+            recipients = await self._get_alert_recipients(aid)
+            if user_id in recipients:
+                target_ids.append(aid)
+
+        removed = 0
+        for aid in target_ids:
             endpoint = self._resolve_path("data_alert_user_single", alert_id=aid, user_id=user_id)
             try:
                 await self._client.delete(endpoint)
@@ -217,5 +236,14 @@ class AlertService:
                 logger.warning(f"Failed to remove alert recipient from {aid}: {e}")
                 self._audit.log_failure(AuditAction.REMOVE_ALERT, error_message=str(e), old_username=username, object_id=aid)
 
-        print_status("DONE", f"Removed {removed} alert memberships from {username}")
+        print_status("DONE", f"Removed {removed} alert memberships from {username} (checked {len(target_ids)}/{len(all_alert_ids)} alerts)")
         return removed
+
+    async def remove_user_from_alert(self, alert_id: str, user_id: str, username: str) -> None:
+        endpoint = self._resolve_path("data_alert_user_single", alert_id=alert_id, user_id=user_id)
+        await self._client.delete(endpoint)
+
+    async def add_user_to_alert(self, alert_id: str, user_id: str, username: str) -> None:
+        endpoint = self._resolve_path("data_alert_users", alert_id=alert_id)
+        payload = f'<tsRequest><user id="{user_id}"/></tsRequest>'
+        await self._add_recipient_with_retry(endpoint, payload, alert_id)

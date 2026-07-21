@@ -73,6 +73,8 @@ class TableauAuthenticator:
         now = datetime.now(timezone.utc)
         payload = {
             "iss": self._auth_config.jwt_client_id,
+            "iat": now,
+            "nbf": now - timedelta(seconds=30),
             "exp": now + timedelta(minutes=_JWT_EXPIRY_MINUTES),
             "jti": str(uuid.uuid4()),
             "aud": "tableau",
@@ -225,4 +227,4 @@ class TableauAuthenticator:
             await client.post(url, headers=self.get_auth_headers())
         except Exception:
             pass
-        self._rest_api_token
+        self._rest_api_token = None

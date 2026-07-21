@@ -91,6 +91,7 @@ class TableauAPIClient:
     async def paginate(self, endpoint: str, page_size: int = 100) -> AsyncGenerator[ET.Element, None]:
         page_number = 1
         total_available = None
+        page_size_actual = page_size
 
         while True:
             separator = "&" if "?" in endpoint else "?"
@@ -125,7 +126,7 @@ class TableauAPIClient:
             if total_available is None or total_available == 0:
                 break
 
-            fetched_so_far = page_number * page_size
+            fetched_so_far = page_number * page_size_actual
             if fetched_so_far >= total_available:
                 break
 
@@ -148,7 +149,8 @@ class TableauAPIClient:
                 break
 
             total_available = int(pagination.get("totalAvailable", "0"))
-            fetched_so_far = page_number * page_size
+            page_size_actual = int(pagination.get("pageSize", str(page_size)))
+            fetched_so_far = page_number * page_size_actual
             if fetched_so_far >= total_available:
                 break
 

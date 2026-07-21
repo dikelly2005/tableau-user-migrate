@@ -19,6 +19,9 @@ logger = get_logger(__name__)
 _auth_lock = asyncio.Lock()
 _auth_generation: int = 0
 
+_pat_auth_lock = asyncio.Lock()
+_pat_auth_generation: int = 0
+
 # PAT-only endpoint patterns: these endpoints have no JWT scope and require PAT auth.
 # Loaded from tableau_endpoints.json if available, otherwise uses this hardcoded fallback.
 _PAT_ONLY_PATTERNS: list[str] = [
@@ -92,7 +95,7 @@ class BaseTableauClient:
         self._settings = settings
         self._api_delay_s = settings.api.api_delay_ms / 1000.0
         self._rate_limiter = RateLimiter(
-            max_concurrent=10,
+            max_concurrent=int(settings.api.rate_limit_rps),
             rps=float(settings.api.rate_limit_rps),
         )
         self._client = httpx.AsyncClient(
@@ -231,21 +234,31 @@ class BaseTableauClient:
                     continue
 
                 if response.status_code == 401 and attempt < max_retries:
-                    global _auth_generation
-                    gen_before = _auth_generation
-                    async with _auth_lock:
-                        if _auth_generation == gen_before:
-                            self._retry_count += 1
-                            print_status("RETRY", "401 auth expired, re-authenticating")
-                            if use_pat:
+                    if use_pat:
+                        global _pat_auth_generation
+                        gen_before = _pat_auth_generation
+                        async with _pat_auth_lock:
+                            if _pat_auth_generation == gen_before:
+                                self._retry_count += 1
+                                print_status("RETRY", "401 PAT auth expired, re-authenticating")
                                 await auth.authenticate_pat(self._client)
-                            elif auth.auth_method == "jwt" and self._settings.auth.has_pat:
-                                await auth.authenticate_pat(self._client)
+                                _pat_auth_generation += 1
                             else:
-                                await auth.authenticate(self._client)
-                            _auth_generation += 1
-                        else:
-                            logger.debug("401 handled by another request, using refreshed token")
+                                logger.debug("401 (PAT) handled by another request, using refreshed token")
+                    else:
+                        global _auth_generation
+                        gen_before = _auth_generation
+                        async with _auth_lock:
+                            if _auth_generation == gen_before:
+                                self._retry_count += 1
+                                print_status("RETRY", "401 auth expired, re-authenticating")
+                                if auth.auth_method == "jwt" and self._settings.auth.has_pat:
+                                    await auth.authenticate_pat(self._client)
+                                else:
+                                    await auth.authenticate(self._client)
+                                _auth_generation += 1
+                            else:
+                                logger.debug("401 handled by another request, using refreshed token")
                     continue
 
                 if response.status_code == 403 and not use_pat and self._settings.auth.has_pat:
@@ -326,4 +339,9 @@ class BaseTableauClient:
             await self._auth.sign_out(self._client)
         except Exception:
             pass
+        if self._pat_auth:
+            try:
+                await self._pat_auth.sign_out(self._client)
+            except Exception:
+                pass
         await self._client.aclose()

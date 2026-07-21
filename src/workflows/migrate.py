@@ -16,6 +16,14 @@ from src.workflows.cleanup_mixin import CleanupMixin
 
 logger = get_logger(__name__)
 
+
+def _check_shutdown() -> bool:
+    try:
+        from src.main import is_shutdown_requested
+        return is_shutdown_requested()
+    except ImportError:
+        return False
+
 _USER_CREATION_DELAY_SECONDS = 4
 _OWNERSHIP_TRANSFER_DELAY_SECONDS = 2
 _CUSTOM_VIEW_PROPAGATION_DELAY_SECONDS = 1.5
@@ -64,7 +72,18 @@ class MigrateWorkflow(UserReportMixin, CleanupMixin):
 
     async def _ensure_token(self, phase_name: str) -> None:
         if self._authenticator and self._http_client:
-            await self._authenticator.ensure_token_for_phase(self._http_client, phase_name)
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    await self._authenticator.ensure_token_for_phase(self._http_client, phase_name)
+                    return
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        wait = 2 ** (attempt + 1)
+                        logger.warning(f"Token refresh failed for phase '{phase_name}' (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {wait}s...")
+                        await asyncio.sleep(wait)
+                    else:
+                        raise
 
     async def execute(self, mappings: List[Dict], audit_dir: Path) -> BatchResult:
         print_status("START", f"Migrate workflow: {len(mappings)} users")
@@ -82,6 +101,9 @@ class MigrateWorkflow(UserReportMixin, CleanupMixin):
         await self._ensure_token("user_creation")
         user_map = {}
         for m in mappings:
+            if _check_shutdown():
+                print_status("STOP", "Graceful shutdown — stopping after current checkpoint save")
+                break
             old_username = m["old_username"]
             new_username = m["new_username"]
 
@@ -126,6 +148,9 @@ class MigrateWorkflow(UserReportMixin, CleanupMixin):
         # Phase 6: Access Cloning
         await self._ensure_token("access_cloning")
         for old_username, info in user_map.items():
+            if _check_shutdown():
+                print_status("STOP", "Graceful shutdown — stopping after current checkpoint save")
+                break
             old_user_id = info["old_user_id"]
             new_user_id = info["new_user_id"]
             new_username = info["new_username"]
@@ -318,15 +343,21 @@ class MigrateWorkflow(UserReportMixin, CleanupMixin):
             elif old_groups and len(new_groups) < len(old_groups):
                 issues.append(f"group_count_mismatch:expected={len(old_groups)},actual={len(new_groups)}")
 
-            # 7. Verify permissions transferred
+            # 7. Verify permissions transferred (excluding non-transferable)
             new_perms = self._cache.get_user_permissions(new_user_id)
             old_perms = self._cache.get_user_permissions(old_user_id)
+            old_transferable = [
+                p for p in old_perms
+                if p.get("capability_name") != "InheritedProjectLeader"
+                and not self._permissions._is_locked_project_content(p.get("content_type", ""), p.get("content_id", ""))
+            ]
             counts["old_user_permissions"] = len(old_perms)
+            counts["old_user_transferable_permissions"] = len(old_transferable)
             counts["new_user_permissions"] = len(new_perms)
-            if old_perms and not new_perms:
+            if old_transferable and not new_perms:
                 issues.append("new_user_has_no_permissions")
-            elif old_perms and len(new_perms) < len(old_perms) * 0.5:
-                issues.append(f"permissions_significantly_fewer:expected~{len(old_perms)},actual={len(new_perms)}")
+            elif old_transferable and len(new_perms) < len(old_transferable):
+                issues.append(f"permissions_missing:expected={len(old_transferable)},actual={len(new_perms)}")
 
             # 8. Verify favorites transferred
             new_favorites = self._cache.get_child_records("user_favorites", new_user_id) if self._cache.has_dimension("user_favorites") else []
